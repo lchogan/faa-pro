@@ -147,7 +147,8 @@ def detect_taxi(pdf_path: Path) -> dict:
             "filled": filled,
             "is_taxi_surface": is_taxi_surface,
             "is_near_black": is_near_black,
-            "subpaths": items_to_subpaths(items) if is_taxi_surface else None,
+            # Always store subpaths — Step 5 needs them for ML-runway PCA.
+            "subpaths": items_to_subpaths(items),
         })
 
     taxi_surface_indices = [i for i, p in enumerate(all_polys)

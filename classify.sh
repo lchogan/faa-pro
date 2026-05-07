@@ -95,31 +95,23 @@ JSON
     echo "   ✓ extracted $path_count paths"
 
     # ------------------------------------------------------------------
-    # Step 2 — Python: build features, run model + override
+    # Step 2 — classify_pipeline.py runs the full 5-step pipeline in
+    #          order: rule-based taxi (1+2), runway-label candidates
+    #          (3), ML on remaining unclaimed (4), centerline validation
+    #          of candidates (5). ML never sees polygons claimed in
+    #          steps 1-3.
     # ------------------------------------------------------------------
-    echo "   [2/3] Python: classify paths..."
-    "$PYTHON" "$PROJECT/python/predict_one.py" \
+    echo "   [2/3] Pipeline: 5-step classification..."
+    "$PYTHON" "$PROJECT/python/classify_pipeline.py" \
         --paths "$paths_csv" \
-        --airport-folder "$folder" \
+        --pdf "$pdf" \
         --out "$json_out"
 
     if [[ ! -f "$json_out" ]]; then
-        echo "   ERROR: Python produced no predictions JSON."
+        echo "   ERROR: Pipeline produced no predictions JSON."
         return 1
     fi
     echo "   ✓ predictions written"
-
-    # ------------------------------------------------------------------
-    # Step 2.5 — Apply rule-based Taxiways + Taxiway-Labels overrides.
-    #            ML predictions for these two classes are stripped and
-    #            replaced with the rule-based detection in
-    #            taxi_detection.py (gray fill + K-nearest token match).
-    # ------------------------------------------------------------------
-    echo "   [2.5/3] Apply rule-based taxi overrides..."
-    "$PYTHON" "$PROJECT/python/apply_taxi_overrides.py" \
-        --pdf "$pdf" \
-        --predictions "$json_out" \
-        --out "$json_out"
 
     # ------------------------------------------------------------------
     # Step 3 — Illustrator: open PDF, apply predicted layers (matched to
