@@ -352,8 +352,8 @@ def main():
         final_override[i] = True
         final_source[i] = "rule_runway_label_passed"
     for i in fail_idx:
-        final_label[i] = "Other"
-        final_top[i] = "Other"
+        final_label[i] = "Runway Label Rejects"
+        final_top[i] = "Runway Label Rejects"
         final_override[i] = True
         final_source[i] = "rule_runway_label_failed"
 
@@ -399,7 +399,8 @@ def main():
 
     final_counts = pd.Series([r["label"] for r in records]).value_counts()
     print("\nFinal label distribution:")
-    for lab in list(LABELS):
+    extra = ["Runway Label Rejects"]
+    for lab in list(LABELS) + extra:
         n = int(final_counts.get(lab, 0))
         if n:
             print(f"  {lab:<22} {n}")

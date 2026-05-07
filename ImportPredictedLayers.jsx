@@ -39,6 +39,7 @@ var TARGET_LAYERS = [
     "Footprints",
     "Runways",
     "Runway Labels",
+    "Runway Label Rejects",
     "Taxiways",
     "Taxiway Labels",
     "Stars",
@@ -263,11 +264,17 @@ function main() {
             try {
                 var tf = tokenLayer.textFrames.add();
                 tf.contents = String(tk.text);
-                tf.position = [tk.x, tk.y];
                 var attrs = tf.textRange.characterAttributes;
                 attrs.size = TOKEN_FONT_SIZE;
                 attrs.fillColor = tokenColor;
                 tf.textRange.justification = Justification.CENTER;
+                // Now that the frame is sized, measure its actual bbox
+                // (AI y-up: [left, top, right, bottom] with top > bottom)
+                // and translate so the bbox center lands on (tk.x, tk.y).
+                var bnds = tf.geometricBounds;
+                var curCx = (bnds[0] + bnds[2]) / 2;
+                var curCy = (bnds[1] + bnds[3]) / 2;
+                tf.translate(tk.x - curCx, tk.y - curCy);
             } catch (eTok) {}
         }
     }
