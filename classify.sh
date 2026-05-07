@@ -110,6 +110,18 @@ JSON
     echo "   ✓ predictions written"
 
     # ------------------------------------------------------------------
+    # Step 2.5 — Apply rule-based Taxiways + Taxiway-Labels overrides.
+    #            ML predictions for these two classes are stripped and
+    #            replaced with the rule-based detection in
+    #            taxi_detection.py (gray fill + K-nearest token match).
+    # ------------------------------------------------------------------
+    echo "   [2.5/3] Apply rule-based taxi overrides..."
+    "$PYTHON" "$PROJECT/python/apply_taxi_overrides.py" \
+        --pdf "$pdf" \
+        --predictions "$json_out" \
+        --out "$json_out"
+
+    # ------------------------------------------------------------------
     # Step 3 — Illustrator: open PDF, apply predicted layers (matched to
     #          predictions by bbox, not object_id), save diagram.ai
     # ------------------------------------------------------------------
