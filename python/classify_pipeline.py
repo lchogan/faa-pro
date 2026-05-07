@@ -375,12 +375,23 @@ def main():
             "bottom": round(float(df.iloc[i]["bottom"]), 4),
         })
 
+    # Debug: PDF Text Tokens. Each word from the PDF text stream with
+    # its bbox center in AI y-up coords. Consumed by
+    # ImportPredictedLayers.jsx to build a "PDF Text Tokens" layer in
+    # the final AI file.
+    token_records = [{
+        "text": t["text"],
+        "x":    round(t["cx"], 4),
+        "y":    round(page_h - t["cy"], 4),  # PDF y-down -> AI y-up
+    } for t in text_tokens]
+
     payload = {
         "airport": records[0]["airport"] if records else None,
         "model_labels": list(LABELS),
         "maybe_labels": [],
         "confidence_threshold": None,
         "predictions": records,
+        "text_tokens": token_records,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2))

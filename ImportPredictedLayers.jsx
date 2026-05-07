@@ -34,6 +34,7 @@ var CONFIG_FILE = "/tmp/classify_config.json";
 // "Metadata" is the renamed default Layer 1 (items that matched no
 // prediction — chart border, date stamp, etc.).
 var TARGET_LAYERS = [
+    "PDF Text Tokens",
     "Lights",
     "Footprints",
     "Runways",
@@ -44,6 +45,10 @@ var TARGET_LAYERS = [
     "Other",
     "Metadata"
 ];
+
+// Visual style for the PDF Text Tokens debug layer.
+var TOKEN_FONT_SIZE = 4;            // pt
+var TOKEN_FILL_RGB  = [204, 0, 204]; // magenta — easy to spot
 
 function main() {
     // Automated mode: classify.sh wrote a config — skip all dialogs.
@@ -239,6 +244,31 @@ function main() {
             objectId++;
             if (label2 === undefined) { unmatched++; continue; }
             applyLabel(pp, label2);
+        }
+    }
+
+    // PDF Text Tokens debug layer. Each entry in payload.text_tokens
+    // is { text, x, y } in AI y-up coords (page-bottom origin), where
+    // (x, y) is the analyzable center of the original PDF token bbox.
+    // Skip silently if older predictions JSON has no tokens.
+    var tokens = payload.text_tokens || [];
+    if (tokens.length > 0 && layers["PDF Text Tokens"]) {
+        var tokenLayer = layers["PDF Text Tokens"];
+        var tokenColor = new RGBColor();
+        tokenColor.red   = TOKEN_FILL_RGB[0];
+        tokenColor.green = TOKEN_FILL_RGB[1];
+        tokenColor.blue  = TOKEN_FILL_RGB[2];
+        for (var ti = 0; ti < tokens.length; ti++) {
+            var tk = tokens[ti];
+            try {
+                var tf = tokenLayer.textFrames.add();
+                tf.contents = String(tk.text);
+                tf.position = [tk.x, tk.y];
+                var attrs = tf.textRange.characterAttributes;
+                attrs.size = TOKEN_FONT_SIZE;
+                attrs.fillColor = tokenColor;
+                tf.textRange.justification = Justification.CENTER;
+            } catch (eTok) {}
         }
     }
 
