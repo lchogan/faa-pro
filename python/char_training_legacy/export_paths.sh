@@ -27,9 +27,12 @@
 
 set -euo pipefail
 
-PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLASSIFY_JSX="$PROJECT/ClassifyAirport.jsx"
-CORPUS_DIR="$PROJECT/data/char_corpus"
+# Script lives in faa-pro/python/char_training_legacy/. PROJECT_ROOT is
+# the faa-pro project root (two levels up).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CLASSIFY_JSX="$SCRIPT_DIR/ClassifyAirport.jsx"
+CORPUS_DIR="$PROJECT_ROOT/data/char_training_legacy/char_corpus"
 CONFIG="/tmp/classify_config.json"
 
 DEFAULT_ROOTS=(

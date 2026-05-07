@@ -17,7 +17,6 @@ set -euo pipefail
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$PROJECT/.venv/bin/python3"
-CLASSIFY_JSX="$PROJECT/ClassifyAirport.jsx"
 IMPORT_JSX="$PROJECT/ImportPredictedLayers.jsx"
 CONFIG="/tmp/classify_config.json"
 
