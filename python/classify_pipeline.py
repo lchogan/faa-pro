@@ -98,7 +98,17 @@ HULL_EXEMPT_CLASSES = frozenset({
 def _runway_axis(subpaths, fallback_rect):
     """PCA principal axis of a runway polygon's anchor points. Returns
     (cx, cy, ux, uy, half_len) where ux,uy is a unit vector along the
-    axis and half_len is the longitudinal half-extent."""
+    axis and half_len is the longitudinal half-extent.
+
+    The center is the midpoint of the (min, max) projections along the
+    axis, NOT the naive arr.mean(axis=0). Subpath rings often repeat
+    their first point as a closing anchor, and PathItem geometry can
+    distribute anchors non-uniformly along the rectangle (more on one
+    side than the other). Either skews the naive mean and produces
+    asymmetric half-extents, so a token painted just past the
+    "shorter" end appears to fall short of the threshold. Using the
+    projection midpoint guarantees symmetric per-end half-lengths.
+    """
     pts: list[tuple[float, float]] = []
     for ring in subpaths or []:
         pts.extend(ring)
@@ -108,15 +118,21 @@ def _runway_axis(subpaths, fallback_rect):
             return ((x0 + x1) / 2, (y0 + y1) / 2, 1.0, 0.0, (x1 - x0) / 2)
         return ((x0 + x1) / 2, (y0 + y1) / 2, 0.0, 1.0, (y1 - y0) / 2)
     arr = np.asarray(pts, dtype=float)
-    centroid = arr.mean(axis=0)
-    centered = arr - centroid
+    naive_centroid = arr.mean(axis=0)
+    centered = arr - naive_centroid
     _, _, vt = np.linalg.svd(centered, full_matrices=False)
     direction = vt[0]
     norm = float(np.linalg.norm(direction)) or 1.0
     ux, uy = float(direction[0]) / norm, float(direction[1]) / norm
-    proj = centered @ np.array([ux, uy])
-    return (float(centroid[0]), float(centroid[1]), ux, uy,
-            float((proj.max() - proj.min()) / 2.0))
+    axis = np.array([ux, uy])
+    proj = centered @ axis
+    long_min = float(proj.min())
+    long_max = float(proj.max())
+    long_offset = (long_min + long_max) / 2.0
+    cx = float(naive_centroid[0]) + long_offset * ux
+    cy = float(naive_centroid[1]) + long_offset * uy
+    half_len = (long_max - long_min) / 2.0
+    return (cx, cy, ux, uy, half_len)
 
 
 def _segment_intersects_bbox(p1, p2, x0, y0, x1, y1) -> bool:
