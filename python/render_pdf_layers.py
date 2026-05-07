@@ -138,9 +138,29 @@ def main():
 
     # OCG (= Illustrator layer) creation. Order matters — the first OCG
     # ends up at the top of Illustrator's Layers panel.
+    # OCG creation. PyMuPDF's add_ocg() can't accept a list for `intent`
+    # (its assertion requires str), so we patch each OCG's /Intent and
+    # /Usage dict entries via xref_set_key after creation. Without
+    # /Intent containing "Design" and /Usage with /CreatorInfo
+    # /Subtype/Artwork, Illustrator treats the OCGs as inert "PDF Layers"
+    # metadata and dumps everything into Layer 1.
     ocgs: dict[str, int] = {}
+    ocg_xrefs_in_panel_order: list[int] = []
     for name in TARGET_LAYERS:
-        ocgs[name] = out_doc.add_ocg(name, on=1)
+        xref = out_doc.add_ocg(name, on=1)
+        out_doc.xref_set_key(xref, "Intent", "[/View/Design]")
+        out_doc.xref_set_key(
+            xref, "Usage",
+            "<</CreatorInfo<</Creator(faa-pro)/Subtype/Artwork>>>>",
+        )
+        ocgs[name] = xref
+        ocg_xrefs_in_panel_order.append(xref)
+
+    # /OCProperties/D/Order controls the layer order in Illustrator's
+    # panel. First entry = topmost layer.
+    order_str = "[" + " ".join(f"{x} 0 R" for x in ocg_xrefs_in_panel_order) + "]"
+    out_doc.xref_set_key(out_doc.pdf_catalog(),
+                         "OCProperties/D/Order", order_str)
 
     layer_counts: dict[str, int] = {name: 0 for name in TARGET_LAYERS}
 
