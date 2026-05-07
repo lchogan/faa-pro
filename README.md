@@ -31,7 +31,7 @@ scripting in the production path.
         ▼
 <airport>_paths.csv             4331 polygons w/ geometric features
         │
-        │  Step 2   classify_pipeline.py — the brain (5 substeps)
+        │  Step 2   classify_pipeline.py — the brain (6 substeps)
         ▼
 <airport>_predictions.json      one record per polygon, AI y-up bbox
         │
@@ -40,7 +40,7 @@ scripting in the production path.
 <airport>-diagram.svg           ten <g> layers, Inkscape-tagged
 ```
 
-### `classify_pipeline.py` — the 5 substeps
+### `classify_pipeline.py` — the 6 substeps
 
 Polygons claimed in earlier substeps are **removed from the pool** seen
 by every later substep. ML never decides Taxiways, Taxiway Labels, or
@@ -91,6 +91,15 @@ Runways.
    gets overridden). Tokens are reserved across runway ends, so a
    `9L` matched at one runway can't be re-used at another.
 
+6. **Concave-hull rejection (post-everything).** Build a concave hull
+   (`shapely.concave_hull(ratio=0.0)`, no buffer) over the rule-claimed
+   Runways + Taxiways' anchor points. Any polygon whose centroid sits
+   outside the hull is demoted to **Other**. Runways, Taxiways, Runway
+   Labels, and Taxiway Labels are exempt — they're rule-trusted, and
+   labels can legitimately sit at chart edges. The bulk of the work
+   here is collapsing ML false-positive Lights and Footprints scattered
+   across legend areas, scale bars, and surrounding text.
+
 The PDF Text Tokens debug layer is always emitted: every word in the
 PDF text stream as a magenta 4pt text frame at its bbox center.
 Useful for spot-checking why a token did or didn't qualify.
@@ -102,12 +111,13 @@ faa-pro/
 ├── classify.sh                          # entry point
 ├── README.md                            # this file
 ├── python/
-│   ├── classify_pipeline.py             # 5-step orchestrator (Step 2)
+│   ├── classify_pipeline.py             # 6-step orchestrator (Step 2)
 │   ├── extract_paths_fitz.py            # PyMuPDF path extraction (Step 1)
 │   ├── render_svg_layers.py             # SVG export (Step 3)
 │   ├── chart_scene.py                   # PDF → polygons + clips + tokens (single source of truth)
-│   ├── taxi_detection.py                # rule-based taxi (steps 1+2 of pipeline)
-│   ├── runway_detection.py              # rule-based runway (step 3 of pipeline, NASR-driven)
+│   ├── taxi_detection.py                # rule-based taxi (substeps 1+2)
+│   ├── runway_detection.py              # rule-based runway (substep 3, NASR-driven)
+│   ├── hull_filter.py                   # concave-hull rejection (substep 6)
 │   ├── pdf_char_override.py             # Lights heuristic + axis helpers
 │   ├── relational.py                    # ML feature engineering
 │   ├── load.py                          # CSV schema + LABELS tuple
@@ -198,10 +208,11 @@ The user's six-step plan for the rebuilt pipeline:
 3. **Taxiway and runway labels.** Done — taxi labels via
    step-2 K-nearest, runway labels via centerline-token search
    (now consumes step 3's rule-claimed runways).
-4. **Concave hull rejection.** Not started. Build a concave hull
-   over runways + taxiways, reject any unclaimed polygon whose
-   centroid sits outside it (no buffer; runways/taxiways/labels
-   exempt).
+4. **Concave hull rejection.** Done — `python/hull_filter.py` runs as
+   pipeline substep 6. `shapely.concave_hull(ratio=0.0)` over rule-
+   claimed Runways + Taxiways' anchor points, no buffer; centroid-in-
+   hull test demotes anything outside to Other; Runways, Taxiways,
+   Runway Labels, and Taxiway Labels are exempt.
 5. **Footprint ML refactor.** Not started. Train footprint binary
    on the union of the 30 clean files plus the 125 NASR-matched
    airports from the legacy 160-file corpus (international airports

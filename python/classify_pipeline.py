@@ -26,6 +26,15 @@ from the pool seen by every later step.
                                   centerline picks the label. Claim K =
                                   len(token) nearest near-black filled
                                   unclaimed polygons -> Runway Labels.
+  6.   Hull rejection             Build a concave hull (no buffer) over
+                                  the rule-claimed Runways + Taxiways'
+                                  anchor points. Any polygon whose
+                                  centroid sits outside the hull is
+                                  demoted to Other. Runways, Taxiways,
+                                  Runway Labels, and Taxi Labels are
+                                  exempt — they're rule-trusted, and
+                                  labels can legitimately sit at chart
+                                  edges.
 
 Output: predictions JSON in the same format as predict_one.py — one
 record per polygon, with bbox in AI y-up coordinates so
@@ -55,6 +64,7 @@ from extract_pdf_text import (
     find_known_runway_designations,
     load_nasr_runways,
 )
+from hull_filter import hull_reject
 from load import LABELS, load_features_all
 from pdf_char_override import apply_pdf_char_override
 from predict_one import extract_pdf_text_for_one
@@ -72,6 +82,13 @@ CENTERLINE_WIDTHS_PT = (1.0, 10.0, 25.0, 50.0, 100.0)
 # Runways now come from the rule-based detector (step 3), so ML must
 # not assign them either.
 ML_EXCLUDE_CLASSES = ("Taxiways", "Taxiway Labels", "Runway Labels", "Runways")
+# Step 6 (hull rejection): classes whose polygons are exempt from the
+# centroid-in-hull test. Rule-claimed and never re-tested. Labels in
+# particular can sit at chart edges (runway numbers past the threshold,
+# taxiway letters at the far end of a stub) so they must not be culled.
+HULL_EXEMPT_CLASSES = frozenset({
+    "Runways", "Taxiways", "Runway Labels", "Taxiway Labels",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +453,34 @@ def main():
     args.out.with_suffix(".step5.json").write_text(
         json.dumps(step5_diag, indent=2, default=str)
     )
+
+    # ---- Step 6: concave-hull rejection ------------------------------
+    # Build a concave hull (no buffer) over the rule-claimed Runways +
+    # Taxiways' anchor points. Demote any non-exempt polygon whose
+    # centroid sits outside that hull to Other. Exempt classes:
+    # Runways, Taxiways, Runway Labels, Taxi Labels — rule-trusted and
+    # labels can legitimately sit at chart edges.
+    print(f"[pipeline] step 6: concave-hull rejection")
+    hull_candidates = [
+        i for i in range(len(all_polys))
+        if final_label[i] not in HULL_EXEMPT_CLASSES
+    ]
+    demote_idx, hull_diag = hull_reject(
+        all_polys,
+        anchor_indices=surf_set | rwy_set,
+        candidate_indices=hull_candidates,
+    )
+    print(f"  hull anchor pts: {hull_diag['n_anchor_points']}, "
+          f"area: {hull_diag['hull_area']:.0f}")
+    print(f"  candidates tested: {hull_diag['n_candidates_tested']}, "
+          f"demoted to Other: {hull_diag['n_demoted']}")
+
+    for i in demote_idx:
+        prev = final_label[i]
+        final_label[i] = "Other"
+        final_top[i] = "Other"
+        final_override[i] = True
+        final_source[i] = f"hull_reject_from_{prev}"
 
     # ---- Build records JSON in predict_one.py format -----------------
     records = []

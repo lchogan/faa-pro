@@ -20,7 +20,7 @@ That runs three Python steps:
 | Step | Script | Purpose |
 |------|--------|---------|
 | 1    | `extract_paths_fitz.py` | PyMuPDF path extraction → `<airport>_paths.csv` |
-| 2    | `classify_pipeline.py`  | 5-step classification → `<airport>_predictions.json` |
+| 2    | `classify_pipeline.py`  | 6-step classification → `<airport>_predictions.json` |
 | 3    | `render_svg_layers.py`  | SVG render with native AI layers → `<airport>-diagram.svg` |
 
 `classify_pipeline.py` itself imports `taxi_detection.detect_taxi`
@@ -96,7 +96,8 @@ python train.py --features features.parquet --out-dir runs/v25
 
 ```
 python/
-├── classify_pipeline.py         # production: 5-step orchestrator
+├── classify_pipeline.py         # production: 6-step orchestrator
+├── hull_filter.py               # concave-hull rejection (substep 6)
 ├── extract_paths_fitz.py        # production: PyMuPDF path/feature extraction
 ├── render_svg_layers.py         # production: layered SVG export
 ├── taxi_detection.py            # rule-based gray-fill + taxi-label K-nearest
