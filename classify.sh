@@ -6,10 +6,12 @@
 #   bash classify.sh airports/bna-faa.pdf airports/atl-faa.pdf
 #
 # The PDF must be named <airport>-faa.pdf.
-# Produces <airport>-diagram.ai in the same folder as the PDF.
+# Produces <airport>-diagram.svg in the same folder as the PDF. Open the
+# SVG in Illustrator (File > Open) — top-level groups are tagged as
+# Inkscape layers, which Illustrator's SVG importer turns into native
+# layers. Save As .ai if you want the .ai extension.
 #
 # Requires:
-#   - Adobe Illustrator installed and accessible via AppleScript
 #   - Python venv at faa-pro/.venv with deps installed
 #   - Trained model at faa-pro/python/runs/v24/model.lgb
 
@@ -17,30 +19,6 @@ set -euo pipefail
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$PROJECT/.venv/bin/python3"
-IMPORT_JSX="$PROJECT/ImportPredictedLayers.jsx"
-CONFIG="/tmp/classify_config.json"
-
-# ---------------------------------------------------------------------------
-# run_jsx <path-to-jsx>
-# Tells Illustrator (via AppleScript) to run the given JSX file and waits
-# for it to finish before returning.
-# Reads file content directly — avoids #include reliability issues in AI 2022+.
-# ---------------------------------------------------------------------------
-run_jsx() {
-    local jsx="$1"
-    # Pass the path as an argv argument so the heredoc stays single-quoted
-    # (no variable expansion) and the path doesn't need escaping.
-    osascript - "$jsx" <<'APPLESCRIPT' > /dev/null
-on run argv
-    set jsx_path to item 1 of argv
-    tell application "Adobe Illustrator"
-        activate
-        set scriptText to read (POSIX file jsx_path) as «class utf8»
-        do javascript scriptText
-    end tell
-end run
-APPLESCRIPT
-}
 
 # ---------------------------------------------------------------------------
 # process_one <pdf-path>
@@ -59,25 +37,11 @@ process_one() {
     local paths_csv="$folder/${airport}_paths.csv"
     local edges_csv="$folder/${airport}_paths_edges.csv"
     local json_out="$folder/${airport}_predictions.json"
-    local diagram_ai="$folder/${airport}-diagram.ai"
+    local pdf_text_csv="$folder/${airport}_predictions.pdf_text.csv"
+    local diagram_svg="$folder/${airport}-diagram.svg"
 
     echo ""
     echo "▶  $airport"
-
-    # Write config for the import-step JSX. ready_ai is intentionally
-    # absent — the ImportPredictedLayers JSX falls back to opening the
-    # source PDF directly when there's no -ready.ai (PyMuPDF pipeline).
-    cat > "$CONFIG" <<JSON
-{
-  "pdf_path":   "$pdf",
-  "airport":    "$airport",
-  "folder":     "$folder",
-  "paths_csv":  "$paths_csv",
-  "edges_csv":  "$edges_csv",
-  "json_path":  "$json_out",
-  "diagram_ai": "$diagram_ai"
-}
-JSON
 
     # ------------------------------------------------------------------
     # Step 1 — PyMuPDF: extract path CSV (no Illustrator)
@@ -114,21 +78,26 @@ JSON
     echo "   ✓ predictions written"
 
     # ------------------------------------------------------------------
-    # Step 3 — Illustrator: open PDF, apply predicted layers (matched to
-    #          predictions by bbox, not object_id), save diagram.ai
+    # Step 3 — Render layered SVG. Each layer is a top-level <g> tagged
+    #          with Inkscape layer attributes; Illustrator's SVG
+    #          importer turns each into a native AI layer. ~1s vs the
+    #          old JSX route's 60+s.
     # ------------------------------------------------------------------
-    echo "   [3/3] Illustrator: apply layers + save diagram..."
-    run_jsx "$IMPORT_JSX"
+    echo "   [3/3] Render layered SVG..."
+    "$PYTHON" "$PROJECT/python/render_svg_layers.py" \
+        --pdf "$pdf" \
+        --predictions "$json_out" \
+        --out "$diagram_svg" >/dev/null
 
-    if [[ ! -f "$diagram_ai" ]]; then
-        echo "   ERROR: ImportPredictedLayers produced no diagram.ai."
+    if [[ ! -f "$diagram_svg" ]]; then
+        echo "   ERROR: SVG renderer produced no output."
         return 1
     fi
 
-    # Clean up all intermediates.
-    rm -f "$paths_csv" "$edges_csv" "$json_out" "$CONFIG"
+    # Clean up intermediates. Predictions JSON kept for debugging.
+    rm -f "$paths_csv" "$edges_csv" "$pdf_text_csv"
 
-    echo "   ✓ saved: $diagram_ai"
+    echo "   ✓ saved: $diagram_svg"
 }
 
 # ---------------------------------------------------------------------------
