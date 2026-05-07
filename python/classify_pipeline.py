@@ -205,12 +205,19 @@ def _match_runway_labels(runway_indices, all_polys, text_tokens,
     Mutates `claimed_polys`.
 
     Returns:
-      (label_indices, diagnostics)
-        label_indices: set[int] of polygon indices to label as Runway Labels
-        diagnostics:   list[dict] one per (runway, end), records what
-                       happened — token text, width that succeeded, lat
-                       offset, longitudinal distance past end, claimed
-                       polygon indices. Used by step-5 print-out.
+      (label_indices, diagnostics, used_token_ids)
+        label_indices:   set[int] of polygon indices labeled Runway Labels
+        diagnostics:     list[dict] one per (runway, end), records what
+                         happened — token text, width that succeeded, lat
+                         offset, longitudinal distance past end, claimed
+                         polygon indices. Used by step-3 print-out.
+        used_token_ids:  set[int] of id() values for token dicts that
+                         were consumed by this matcher. The pipeline
+                         passes these into the taxi-label matcher so
+                         the same token can't be claimed twice (which
+                         would otherwise pull arrowheads / nearby
+                         symbols into Taxiway Labels at airports where
+                         a runway designator sits over a taxiway).
     """
     rwy_set = nasr_designations or set()
     if rwy_set:
@@ -316,7 +323,7 @@ def _match_runway_labels(runway_indices, all_polys, text_tokens,
             diag["claimed"] = list(nearest)
             diagnostics.append(diag)
 
-    return label_indices, diagnostics
+    return label_indices, diagnostics, used_token_ids
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +388,7 @@ def main():
     runway_indices = sorted(rwy_set)
     print(f"[pipeline] step 3: centerline-token search over "
           f"{len(runway_indices)} rule-claimed runways")
-    rwy_label_idx, step3_diag = _match_runway_labels(
+    rwy_label_idx, step3_diag, step3_used_token_ids = _match_runway_labels(
         runway_indices, all_polys, text_tokens, claimed,
         nasr_designations=nasr_for_airport,
     )
@@ -392,9 +399,13 @@ def main():
     claimed |= rwy_label_idx
 
     # ---- Step 4: taxi-label K-nearest claim --------------------------
+    # Tokens consumed by step 3 are excluded — each PDF text token
+    # identifies polygons at most once across the pipeline.
     print(f"[pipeline] step 4: taxi-label K-nearest claim")
     taxi_label_list = match_taxi_labels(
-        all_polys, taxi_surfaces, text_tokens, claimed_polys=claimed,
+        all_polys, taxi_surfaces, text_tokens,
+        claimed_polys=claimed,
+        excluded_token_ids=step3_used_token_ids,
     )
     label_set = set(taxi_label_list)
     claimed |= label_set

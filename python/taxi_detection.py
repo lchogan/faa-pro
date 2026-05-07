@@ -94,7 +94,8 @@ def _bbox_touches(t: dict, surfaces: list[dict]) -> bool:
 def match_taxi_labels(all_polys: list[dict],
                       taxi_surfaces: list[dict],
                       text_tokens: list[dict],
-                      claimed_polys: set[int] | None = None) -> list[int]:
+                      claimed_polys: set[int] | None = None,
+                      excluded_token_ids: set[int] | None = None) -> list[int]:
     """For each token matching the taxi-label regex whose bbox touches
     a taxi-surface polygon, claim the K = len(token.text) nearest
     near-black filled polygons (excluding ones already in
@@ -104,10 +105,21 @@ def match_taxi_labels(all_polys: list[dict],
     contains taxi surfaces, runways, and runway labels — so a digit
     glyph that belongs to a runway designator is unavailable here.
 
+    `excluded_token_ids` is a set of id(token) values for tokens
+    already consumed by an earlier label step (e.g. runway-label
+    matching). Each token can identify polygons at most once across
+    the pipeline; without this, a runway designator that overlaps a
+    taxi surface would re-qualify here and pull arrowheads or other
+    near-black symbols into Taxiway Labels via the K-nearest claim.
+
     Returns the list of claimed indices in claim order.
     """
     claimed: set[int] = set(claimed_polys or [])
-    pattern_tokens = [t for t in text_tokens if TAXIWAY_RE.match(t["text"])]
+    excluded_ids: set[int] = set(excluded_token_ids or [])
+    pattern_tokens = [
+        t for t in text_tokens
+        if TAXIWAY_RE.match(t["text"]) and id(t) not in excluded_ids
+    ]
     qualifying = [t for t in pattern_tokens if _bbox_touches(t, taxi_surfaces)]
 
     def _is_taxi_candidate(p):
