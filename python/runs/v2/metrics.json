@@ -1,0 +1,104 @@
+{
+  "fold_metrics": [
+    {
+      "fold": 1,
+      "best_iter": 126,
+      "macro_f1": 0.8079044553132785
+    },
+    {
+      "fold": 2,
+      "best_iter": 120,
+      "macro_f1": 0.8405925082373712
+    },
+    {
+      "fold": 3,
+      "best_iter": 118,
+      "macro_f1": 0.8532886409278686
+    },
+    {
+      "fold": 4,
+      "best_iter": 175,
+      "macro_f1": 0.8294589202233427
+    },
+    {
+      "fold": 5,
+      "best_iter": 130,
+      "macro_f1": 0.8707652024897055
+    }
+  ],
+  "oof_classification_report": {
+    "Taxiways": {
+      "precision": 0.8556034482758621,
+      "recall": 0.9589371980676329,
+      "f1-score": 0.9043280182232346,
+      "support": 414.0
+    },
+    "Footprints": {
+      "precision": 0.8666666666666667,
+      "recall": 0.9069767441860465,
+      "f1-score": 0.8863636363636364,
+      "support": 903.0
+    },
+    "Runways": {
+      "precision": 0.9846153846153847,
+      "recall": 0.9846153846153847,
+      "f1-score": 0.9846153846153847,
+      "support": 65.0
+    },
+    "Lights": {
+      "precision": 0.8333333333333334,
+      "recall": 0.8333333333333334,
+      "f1-score": 0.8333333333333334,
+      "support": 288.0
+    },
+    "Taxiway Labels": {
+      "precision": 0.7954949614700652,
+      "recall": 0.786174575278266,
+      "f1-score": 0.7908073070123748,
+      "support": 1707.0
+    },
+    "Runway Labels": {
+      "precision": 0.6864406779661016,
+      "recall": 0.3253012048192771,
+      "f1-score": 0.44141689373297005,
+      "support": 249.0
+    },
+    "Stars": {
+      "precision": 0.8461538461538461,
+      "recall": 0.9565217391304348,
+      "f1-score": 0.8979591836734694,
+      "support": 23.0
+    },
+    "Other": {
+      "precision": 0.9816424514387925,
+      "recall": 0.9833705322058407,
+      "f1-score": 0.9825057319639436,
+      "support": 31811.0
+    },
+    "accuracy": 0.9657924421883812,
+    "macro avg": {
+      "precision": 0.8562438462400066,
+      "recall": 0.841903838954527,
+      "f1-score": 0.8401661861147933,
+      "support": 35460.0
+    },
+    "weighted avg": {
+      "precision": 0.964922250897071,
+      "recall": 0.9657924421883812,
+      "f1-score": 0.9648545387343462,
+      "support": 35460.0
+    }
+  },
+  "labels": [
+    "Taxiways",
+    "Footprints",
+    "Runways",
+    "Lights",
+    "Taxiway Labels",
+    "Runway Labels",
+    "Stars",
+    "Other"
+  ],
+  "n_rows_labeled": 35460,
+  "n_airports": 30
+}

@@ -1,0 +1,9 @@
+,pred_Taxiways,pred_Footprints,pred_Runways,pred_Lights,pred_Taxiway Labels,pred_Runway Labels,pred_Stars,pred_Other
+true_Taxiways,397,0,0,0,1,0,0,16
+true_Footprints,2,819,1,0,12,0,3,66
+true_Runways,0,1,64,0,0,0,0,0
+true_Lights,0,0,0,240,0,0,1,47
+true_Taxiway Labels,0,6,0,0,1342,20,0,339
+true_Runway Labels,0,3,0,0,49,81,0,116
+true_Stars,0,0,0,0,0,0,22,1
+true_Other,65,116,0,48,283,17,0,31282
