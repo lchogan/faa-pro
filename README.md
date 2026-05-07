@@ -46,18 +46,11 @@ Polygons claimed in earlier substeps are **removed from the pool** seen
 by every later substep. ML never decides Taxiways, Taxiway Labels, or
 Runways.
 
-1. **Taxiways (rule-based).** Filled polygons whose RGB is gray
+1. **Taxi surfaces (rule-based).** Filled polygons whose RGB is gray
    (~#cfcfcf with leeway: avg 175–235, channel spread ≤ 20). This is
    the *only* source for Taxiways.
 
-2. **Taxiway Labels (rule-based).** PDF text tokens matching
-   `^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$` (e.g. `C`, `C1`, `A11`, `3`)
-   whose bbox **touches** a Taxiways surface from step 1. For each
-   qualifying token, the K = `len(token)` nearest unclaimed near-black
-   filled polygons (the actual glyph polygons) are claimed as
-   Taxiway Labels.
-
-3. **Runways (rule-based, NASR-driven).** Look up the airport in
+2. **Runways (rule-based, NASR-driven).** Look up the airport in
    `data/nasr_apt_rwy.csv`, count its non-helipad runways → `N`. From
    the unclaimed pool, take the `N` largest polygons by polygon area
    (shoelace, robust to rotation) that are either filled near-black
@@ -71,34 +64,51 @@ Runways.
    in its scissor is claimed (this is how F45's grass strip — drawn
    only as a clipped hatch pattern — gets picked up).
 
-4. **ML — Footprints, Lights, Stars, Other.** The trained LightGBM
-   model (`python/runs/v24/model.lgb`) runs on every polygon *not*
-   claimed by step 1, 2, or 3. The Taxiways / Taxiway Labels /
-   Runways / Runway Labels classes are masked out of the probability
-   matrix so an unclaimed polygon can't fall back into them. The
-   existing `pdf_char_override.apply_pdf_char_override` runs on the
-   filtered set, preserving the Lights-by-stroke heuristic that
-   detects ~1000 light-fixture stripes.
-
-5. **Runway Labels (rule-based, post-ML).** For each rule-claimed
+3. **Runway Labels (rule-based, NASR-driven).** For each rule-claimed
    Runway polygon, compute its principal axis via PCA. From each
    endpoint, search outward through widths `(1, 10, 25, 50, 100)pt`
-   for any runway-pattern (`^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$`)
-   token whose centroid sits in that band. The first width that
-   yields a candidate wins; ties are broken by closeness to the
-   endpoint. The chosen token claims K nearest unclaimed near-black
-   filled polygons → **Runway Labels** (whatever ML had assigned them
-   gets overridden). Tokens are reserved across runway ends, so a
-   `9L` matched at one runway can't be re-used at another.
+   for any token whose normalized form is one of NASR's listed
+   runway endpoints for this airport. NASR designations are
+   normalized to canonical form (`08L → 8L`) and compass-direction
+   names (`NE`, `SW` for turf strips like APF's third runway) are
+   accepted alongside numeric designators. Without NASR, falls back
+   to the generic regex `^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$`. The
+   first width that yields a candidate wins; ties are broken by
+   closeness to the endpoint. The chosen token claims K =
+   `len(token)` nearest unclaimed near-black filled polygons →
+   **Runway Labels**. Tokens are reserved across runway ends, so a
+   `9L` matched at one runway can't be re-used at another. Done
+   BEFORE Taxi Labels so a digit glyph belonging to a runway
+   designator (e.g. APF "5" sitting over a taxiway) is reserved
+   here and not consumed by step 4.
+
+4. **Taxiway Labels (rule-based).** PDF text tokens matching
+   `^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$` (e.g. `C`, `C1`, `A11`, `3`)
+   whose bbox **touches** a Taxiways surface from step 1. For each
+   qualifying token, the K = `len(token)` nearest unclaimed near-black
+   filled polygons (the actual glyph polygons) are claimed as
+   Taxiway Labels. Runs after Runway Labels (step 3) so any digit
+   glyph that belongs to a runway designator is already claimed and
+   unavailable here.
+
+5. **ML — Footprints, Lights, Stars, Other.** The trained LightGBM
+   model (`python/runs/v24/model.lgb`) runs on every polygon *not*
+   claimed by steps 1–4. The Taxiways / Taxiway Labels / Runways /
+   Runway Labels classes are masked out of the probability matrix so
+   an unclaimed polygon can't fall back into them. The existing
+   `pdf_char_override.apply_pdf_char_override` runs on the filtered
+   set, preserving the Lights-by-stroke heuristic that detects ~1000
+   light-fixture stripes.
 
 6. **Concave-hull rejection (post-everything).** Build a concave hull
    (`shapely.concave_hull(ratio=0.0)`, no buffer) over the rule-claimed
-   Runways + Taxiways' anchor points. Any polygon whose centroid sits
-   outside the hull is demoted to **Other**. Runways, Taxiways, Runway
-   Labels, and Taxiway Labels are exempt — they're rule-trusted, and
-   labels can legitimately sit at chart edges. The bulk of the work
-   here is collapsing ML false-positive Lights and Footprints scattered
-   across legend areas, scale bars, and surrounding text.
+   Runways + Taxi surfaces' anchor points. Any polygon whose centroid
+   sits outside the hull is demoted to **Other**. Runways, Taxi
+   surfaces, Runway Labels, and Taxiway Labels are exempt — they're
+   rule-trusted, and labels can legitimately sit at chart edges. The
+   bulk of the work here is collapsing ML false-positive Lights and
+   Footprints scattered across legend areas, scale bars, and
+   surrounding text.
 
 The PDF Text Tokens debug layer is always emitted: every word in the
 PDF text stream as a magenta 4pt text frame at its bbox center.
@@ -115,8 +125,8 @@ faa-pro/
 │   ├── extract_paths_fitz.py            # PyMuPDF path extraction (Step 1)
 │   ├── render_svg_layers.py             # SVG export (Step 3)
 │   ├── chart_scene.py                   # PDF → polygons + clips + tokens (single source of truth)
-│   ├── taxi_detection.py                # rule-based taxi (substeps 1+2)
-│   ├── runway_detection.py              # rule-based runway (substep 3, NASR-driven)
+│   ├── taxi_detection.py                # rule-based taxi surfaces + labels (substeps 1, 4)
+│   ├── runway_detection.py              # rule-based runway (substep 2, NASR-driven)
 │   ├── hull_filter.py                   # concave-hull rejection (substep 6)
 │   ├── pdf_char_override.py             # Lights heuristic + axis helpers
 │   ├── relational.py                    # ML feature engineering

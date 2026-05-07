@@ -44,14 +44,27 @@ import fitz  # PyMuPDF
 # pattern (compass labels, magnetic variations, etc. also match).
 _PAIR_RE = re.compile(r"^(\d{1,2})([LRC]?)[/\-](\d{1,2})([LRC]?)$")
 _DESIG_RE = re.compile(r"^(\d{1,2})([LRC]?)$")
+# Some small turf airports name their runway by compass direction
+# rather than heading number (e.g. APF runway "NE/SW", a 1850ft turf
+# strip alongside the paved 5/23 and 14/32). NASR records these
+# verbatim. We accept the eight compass forms.
+_COMPASS_RE = re.compile(r"^(N|S|E|W|NE|NW|SE|SW)$")
 
 
 def _normalize_designation(text: str) -> str | None:
-    """Return canonical form ('8L' from '08L', '10' from '10') or None."""
-    m = _DESIG_RE.match(text)
-    if not m:
+    """Return canonical form for a single runway endpoint name:
+       '8L' from '08L', '10' from '10', 'NE' from 'ne'. None if the
+       text isn't a recognizable runway endpoint name."""
+    if not text:
         return None
-    return str(int(m.group(1))) + m.group(2)
+    text = text.strip()
+    m = _DESIG_RE.match(text)
+    if m:
+        return str(int(m.group(1))) + m.group(2)
+    upper = text.upper()
+    if _COMPASS_RE.match(upper):
+        return upper
+    return None
 
 
 def find_known_runway_designations(words):
@@ -76,10 +89,12 @@ def find_known_runway_designations(words):
 def load_nasr_runways(csv_path: Path) -> dict[str, set[str]]:
     """Read NASR APT_RWY.csv and return {airport_code_lower: {canonical_designation, ...}}.
 
-    The RWY_ID column carries pair form ("08L/26R", "10/28"). Each pair is
-    split into its two canonical designations ("8L", "26R", "10", "28").
-    The dict is keyed by FAA airport ID lowercased to match the airport
-    folder names (e.g. "atl", "21d").
+    The RWY_ID column carries pair form ("08L/26R", "10/28", "NE/SW").
+    Each pair is split on '/' or '-' and each part is normalized via
+    `_normalize_designation`, which accepts both numeric (canonical
+    leading-zero stripped) and compass-direction (uppercased) forms.
+    The dict is keyed by FAA airport ID lowercased to match the
+    airport folder names (e.g. "atl", "21d", "apf").
     """
     import csv as _csv
     out: dict[str, set[str]] = {}
@@ -89,16 +104,10 @@ def load_nasr_runways(csv_path: Path) -> dict[str, set[str]]:
             rwy_id = (row.get("RWY_ID") or "").strip()
             if not ap or not rwy_id:
                 continue
-            m = _PAIR_RE.match(rwy_id)
-            if not m:
-                # Single-end designations are rare in NASR but fall back gracefully.
-                norm = _normalize_designation(rwy_id)
+            for part in re.split(r"[/\-]", rwy_id):
+                norm = _normalize_designation(part)
                 if norm:
                     out.setdefault(ap, set()).add(norm)
-                continue
-            d1 = str(int(m.group(1))) + m.group(2)
-            d2 = str(int(m.group(3))) + m.group(4)
-            out.setdefault(ap, set()).update([d1, d2])
     return out
 
 

@@ -4,37 +4,45 @@ classify_pipeline.py — single-pass orchestrator for the new pipeline.
 Steps in strict order. Polygons claimed in earlier steps are removed
 from the pool seen by every later step.
 
-  1+2. Taxiways / Taxi Labels    rule-based (gray-fill detection +
-                                 token regex K-nearest gated on
-                                 bbox-touches-taxi-surface).
-  3.   Runways                    rule-based (NASR runway count +
-                                  top-N polygons by polygon area among
-                                  filled-near-black or stroked
-                                  candidates, after taxi removal).
-                                  Replaces ML-based runway prediction.
-  4.   ML                         on the remaining unclaimed polygons.
-                                  Classes Taxiways / Taxiway Labels /
-                                  Runway Labels / Runways are masked
-                                  out of ML's probability matrix so an
-                                  unclaimed polygon can't fall back
-                                  into them.
-  5.   Centerline-token search    For each rule-claimed Runway, extend
-                                  a thin centerline past each end. The
-                                  closest runway-pattern text token
-                                  whose centroid sits within a
-                                  progressively-widened band along the
-                                  centerline picks the label. Claim K =
-                                  len(token) nearest near-black filled
-                                  unclaimed polygons -> Runway Labels.
-  6.   Hull rejection             Build a concave hull (no buffer) over
-                                  the rule-claimed Runways + Taxiways'
-                                  anchor points. Any polygon whose
-                                  centroid sits outside the hull is
-                                  demoted to Other. Runways, Taxiways,
-                                  Runway Labels, and Taxi Labels are
-                                  exempt — they're rule-trusted, and
-                                  labels can legitimately sit at chart
-                                  edges.
+  1.   Taxi surfaces      rule-based (gray-fill detection from
+                          chart_scene.is_taxi_surface).
+  2.   Runways            rule-based (NASR runway count + top-N
+                          polygons by polygon area among filled-
+                          near-black or stroked candidates, after
+                          taxi-surface removal). Replaces ML-based
+                          runway prediction.
+  3.   Runway Labels      For each rule-claimed Runway, extend a
+                          thin centerline past each end. The closest
+                          NASR-listed runway-name token whose
+                          centroid sits within a progressively-
+                          widened band along the centerline picks
+                          the label. Claim K = len(token) nearest
+                          near-black filled unclaimed polygons. NASR
+                          designations are pulled per-airport so a
+                          chart-only token like APF "6" is rejected,
+                          and compass-direction names ("NE/SW")
+                          qualify for turf strips.
+  4.   Taxi Labels        Token regex K-nearest gated on bbox-
+                          touches-taxi-surface, restricted to the
+                          unclaimed pool. Runs AFTER runway-label
+                          matching so a digit glyph that belongs to
+                          a runway designator is no longer available
+                          and a taxi token with the same numeric
+                          string (e.g. APF runway "5" vs a hypothetical
+                          taxi "5") still finds its own glyph
+                          polygons elsewhere on the chart.
+  5.   ML                 On the remaining unclaimed polygons.
+                          Classes Taxiways / Taxiway Labels / Runway
+                          Labels / Runways are masked out of ML's
+                          probability matrix so an unclaimed polygon
+                          can't fall back into them.
+  6.   Hull rejection     Build a concave hull (no buffer) over the
+                          rule-claimed Runways + Taxi surfaces'
+                          anchor points. Any polygon whose centroid
+                          sits outside the hull is demoted to Other.
+                          Runways, Taxi surfaces, Runway Labels, and
+                          Taxi Labels are exempt — rule-trusted, and
+                          labels can legitimately sit at chart edges.
 
 Output: predictions JSON in the same format as predict_one.py — one
 record per polygon, with bbox in AI y-up coordinates so
@@ -59,6 +67,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
+from chart_scene import read_chart
 from extract_pdf_text import (
     _normalize_designation,
     find_known_runway_designations,
@@ -70,7 +79,7 @@ from pdf_char_override import apply_pdf_char_override
 from predict_one import extract_pdf_text_for_one
 from relational import add_relational_features, load_edges, load_pdf_text
 from runway_detection import detect_runways
-from taxi_detection import detect_taxi
+from taxi_detection import match_taxi_labels
 
 
 RUNWAY_RE = re.compile(r"^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$")
@@ -169,14 +178,24 @@ def _segment_intersects_bbox(p1, p2, x0, y0, x1, y1) -> bool:
 # ---------------------------------------------------------------------------
 
 def _match_runway_labels(runway_indices, all_polys, text_tokens,
-                         claimed_polys: set[int]):
-    """For each ML-predicted Runway polygon, search past each end of
-    the polygon's principal axis for a runway-pattern text token whose
+                         claimed_polys: set[int],
+                         nasr_designations: set[str] | None = None):
+    """For each rule-claimed Runway polygon, search past each end of
+    the polygon's principal axis for a runway-name text token whose
     centroid sits within a progressively-widened band along the
     centerline (CENTERLINE_WIDTHS_PT). The first token found at the
     smallest-width band that contains any candidate wins that end. Ties
     inside a band are broken by closeness-to-end (longitudinal
     distance past the endpoint).
+
+    Token eligibility: when `nasr_designations` is provided, only
+    tokens whose normalized form is one of the NASR-listed runway
+    designations for this airport qualify. Without NASR, the function
+    falls back to a generic runway-name regex (matches any 1-36
+    designator with optional L/R/C suffix). NASR is far more reliable
+    — APF's chart contains a "6" token that matches the regex but is
+    not a runway here, and the regex-only path was incorrectly
+    claiming polygons near it.
 
     For each matched token, claim K = len(token.text) nearest unclaimed
     near-black filled polygons as Runway Labels. Polygons claimed for
@@ -193,8 +212,14 @@ def _match_runway_labels(runway_indices, all_polys, text_tokens,
                        offset, longitudinal distance past end, claimed
                        polygon indices. Used by step-5 print-out.
     """
-    # Pre-filter tokens to those matching the runway regex.
-    pattern_tokens = [t for t in text_tokens if RUNWAY_RE.match(t["text"])]
+    rwy_set = nasr_designations or set()
+    if rwy_set:
+        pattern_tokens = [
+            t for t in text_tokens
+            if _normalize_designation(t["text"]) in rwy_set
+        ]
+    else:
+        pattern_tokens = [t for t in text_tokens if RUNWAY_RE.match(t["text"])]
     used_token_ids: set[int] = set()    # id() of token dicts already used
     label_indices: set[int] = set()
     diagnostics: list[dict] = []
@@ -313,31 +338,70 @@ def main():
                     default=Path(__file__).parent.parent / "data" / "nasr_apt_rwy.csv")
     args = ap.parse_args()
 
-    # ---- Steps 1+2: rule-based taxi detection ------------------------
-    print(f"[pipeline] step 1+2: rule-based taxi detection")
-    det = detect_taxi(args.pdf)
-    all_polys = det["all_polys"]
-    text_tokens = det["text_tokens"]
-    page_w, page_h = det["page_w"], det["page_h"]
-    surf_set = set(det["taxi_surface_indices"])
-    label_set = set(det["taxi_label_indices"])
-    print(f"  taxiways: {len(surf_set)}, taxi labels: {len(label_set)}")
+    # NASR runway designations for THIS airport. Used by step 3
+    # (centerline-token search) to identify which PDF text tokens are
+    # actually runway names — rejects APF's stray "6" token (regex
+    # would accept it; NASR confirms APF runways are 5/23, 14/32,
+    # NE/SW). pdf_char_override also consumes the same set.
+    airport_code = args.pdf.stem.replace("-faa", "").lower()
+    nasr_runways_full = (
+        load_nasr_runways(args.nasr_rwy)
+        if args.nasr_rwy and args.nasr_rwy.exists() else {}
+    )
+    nasr_for_airport = nasr_runways_full.get(airport_code, set())
+
+    # ---- Step 1: taxi-surface detection (gray fill) ------------------
+    print(f"[pipeline] step 1: taxi-surface detection")
+    scene = read_chart(args.pdf)
+    all_polys = scene["all_polys"]
+    text_tokens = scene["text_tokens"]
+    clips = scene["clips"]
+    page_w, page_h = scene["page_w"], scene["page_h"]
+    surf_set = {i for i, p in enumerate(all_polys) if p["is_taxi_surface"]}
+    taxi_surfaces = [all_polys[i] for i in sorted(surf_set)]
+    print(f"  taxi surfaces: {len(surf_set)}")
 
     # Claimed = removed-from-pool. Each later step adds to this set.
-    claimed: set[int] = surf_set | label_set
+    claimed: set[int] = set(surf_set)
 
-    # ---- Step 3: rule-based runway detection -------------------------
-    airport_code = args.pdf.stem.replace("-faa", "").lower()
-    print(f"[pipeline] step 3: rule-based runway detection ({airport_code})")
+    # ---- Step 2: rule-based runway detection -------------------------
+    print(f"[pipeline] step 2: rule-based runway detection ({airport_code})")
     rwy_set = detect_runways(
-        all_polys, det["clips"], airport_code, args.nasr_rwy,
+        all_polys, clips, airport_code, args.nasr_rwy,
         page_w=page_w, page_h=page_h, claimed_indices=claimed,
     )
     print(f"  runways: {len(rwy_set)}")
     claimed |= rwy_set
 
-    # ---- Step 4: ML on the remaining unclaimed polygons --------------
-    print(f"[pipeline] step 4: ML on {len(all_polys) - len(claimed)} "
+    # ---- Step 3: runway-label centerline-token search ----------------
+    # Done BEFORE taxi-label matching so digit-glyph polygons that
+    # belong to a runway designator are reserved first. This matters
+    # at airports where a runway (e.g. APF "5") sits over a taxiway
+    # and would otherwise be claimed as a taxi label.
+    runway_indices = sorted(rwy_set)
+    print(f"[pipeline] step 3: centerline-token search over "
+          f"{len(runway_indices)} rule-claimed runways")
+    rwy_label_idx, step3_diag = _match_runway_labels(
+        runway_indices, all_polys, text_tokens, claimed,
+        nasr_designations=nasr_for_airport,
+    )
+    n_matched_ends = sum(1 for d in step3_diag if d.get("matched"))
+    print(f"  runway ends processed: {len(step3_diag)}, "
+          f"token matches: {n_matched_ends}, "
+          f"polygons reassigned: {len(rwy_label_idx)}")
+    claimed |= rwy_label_idx
+
+    # ---- Step 4: taxi-label K-nearest claim --------------------------
+    print(f"[pipeline] step 4: taxi-label K-nearest claim")
+    taxi_label_list = match_taxi_labels(
+        all_polys, taxi_surfaces, text_tokens, claimed_polys=claimed,
+    )
+    label_set = set(taxi_label_list)
+    claimed |= label_set
+    print(f"  taxi labels: {len(label_set)}")
+
+    # ---- Step 5: ML on the remaining unclaimed polygons --------------
+    print(f"[pipeline] step 5: ML on {len(all_polys) - len(claimed)} "
           f"unclaimed polygons")
     df = load_features_all(args.paths)
     if len(df) != len(all_polys):
@@ -382,12 +446,6 @@ def main():
     # preserves the existing Lights-by-stroke detection and runway
     # axis/text logic. Its taxi/runway-label overrides can't fire here
     # because we already removed those polygons from the input pool.
-    nasr_runways_full = (
-        load_nasr_runways(args.nasr_rwy)
-        if args.nasr_rwy and args.nasr_rwy.exists() else {}
-    )
-    airport_code = args.pdf.stem.replace("-faa", "").lower()
-    nasr_for_airport = nasr_runways_full.get(airport_code, set())
     df_unclaimed_r = df_unclaimed.reset_index(drop=True)
     final_labels_unclaimed, _override_mask = apply_pdf_char_override(
         df_unclaimed_r,
@@ -430,6 +488,12 @@ def main():
         final_override[i] = True
         final_source[i] = "rule_runway_nasr_topn"
 
+    for i in rwy_label_idx:
+        final_label[i] = "Runway Labels"
+        final_top[i] = "Runway Labels"
+        final_override[i] = True
+        final_source[i] = "rule_runway_label_centerline"
+
     unclaimed_indices = list(df_unclaimed.index)
     for j, i in enumerate(unclaimed_indices):
         final_label[i] = ml_labels[j]
@@ -442,32 +506,9 @@ def main():
     for lab, n in counts.items():
         print(f"    {lab:<22} {n}")
 
-    # ---- Step 5: centerline-token search -----------------------------
-    # Runway polygons now come from step 3 (rule-based), not ML.
-    runway_indices = sorted(rwy_set)
-    print(f"[pipeline] step 5: centerline-token search over "
-          f"{len(runway_indices)} rule-claimed runways")
-
-    # `claimed` already includes taxi surfaces + taxi labels. The
-    # K-nearest pool inside _match_runway_labels also uses this set so
-    # we never reuse a polygon that's already labeled.
-    rwy_label_idx, step5_diag = _match_runway_labels(
-        runway_indices, all_polys, text_tokens, claimed,
-    )
-    n_matched_ends = sum(1 for d in step5_diag if d.get("matched"))
-    print(f"  runway ends processed: {len(step5_diag)}, "
-          f"token matches: {n_matched_ends}, "
-          f"polygons reassigned: {len(rwy_label_idx)}")
-
-    for i in rwy_label_idx:
-        final_label[i] = "Runway Labels"
-        final_top[i] = "Runway Labels"
-        final_override[i] = True
-        final_source[i] = "rule_runway_label_centerline"
-
-    # Stash diagnostics for the one-shot diag script and inline view.
-    args.out.with_suffix(".step5.json").write_text(
-        json.dumps(step5_diag, indent=2, default=str)
+    # Stash centerline-token diagnostics from step 3 for inline view.
+    args.out.with_suffix(".step3.json").write_text(
+        json.dumps(step3_diag, indent=2, default=str)
     )
 
     # ---- Step 6: concave-hull rejection ------------------------------
