@@ -1,27 +1,25 @@
 """
 classify_pipeline.py — single-pass orchestrator for the new pipeline.
 
-Five steps in strict order. Polygons claimed in earlier steps are
-removed from the pool seen by every later step.
+Steps in strict order. Polygons claimed in earlier steps are removed
+from the pool seen by every later step.
 
-  1. Taxiways              rule-based (gray-fill detection).
-  2. Taxiway Labels        rule-based (token regex + K-nearest, gated
-                           on bbox-touches-taxi-surface).
-  3. Runway Label
-     CANDIDATES            rule-based (token regex + K-nearest, no
-                           validation yet). Tentative — Step 5 decides.
-  4. ML                    on the remaining unclaimed polygons only.
-                           Predicts Footprints / Runways / Lights /
-                           Stars / Other. The classes Taxiways,
-                           Taxiway Labels, and Runway Labels are masked
-                           out of ML's probability matrix so an
-                           unclaimed polygon can't fall back into them.
-  5. Centerline validation Each Step 3 candidate group is judged as a
-                           whole. If any polygon in the group has its
-                           bbox crossed by an extended centerline of
-                           any ML-predicted Runway polygon, the WHOLE
-                           group -> Runway Labels. Otherwise the WHOLE
-                           group -> Other.
+  1+2. Taxiways / Taxi Labels    rule-based (gray-fill detection +
+                                 token regex K-nearest gated on
+                                 bbox-touches-taxi-surface).
+  4.   ML                         on the remaining unclaimed polygons.
+                                  Classes Taxiways / Taxiway Labels /
+                                  Runway Labels are masked out of ML's
+                                  probability matrix so an unclaimed
+                                  polygon can't fall back into them.
+  5.   Centerline-token search    For each ML-predicted Runway, extend
+                                  a thin centerline past each end. The
+                                  closest runway-pattern text token
+                                  whose centroid sits within a
+                                  progressively-widened band along the
+                                  centerline picks the label. Claim K =
+                                  len(token) nearest near-black filled
+                                  unclaimed polygons -> Runway Labels.
 
 Output: predictions JSON in the same format as predict_one.py — one
 record per polygon, with bbox in AI y-up coordinates so
@@ -46,7 +44,11 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from extract_pdf_text import load_nasr_runways
+from extract_pdf_text import (
+    _normalize_designation,
+    find_known_runway_designations,
+    load_nasr_runways,
+)
 from load import LABELS, load_features_all
 from pdf_char_override import apply_pdf_char_override
 from predict_one import extract_pdf_text_for_one
@@ -55,7 +57,11 @@ from taxi_detection import detect_taxi
 
 
 RUNWAY_RE = re.compile(r"^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$")
-RUNWAY_CENTERLINE_PAD_PT = 80.0  # extension past each runway endpoint
+# Step 5: centerline-band widths used to search for runway-name tokens
+# past each runway end. We walk the widths in order and stop at the
+# first width that yields a candidate. 1pt is effectively "directly on
+# the centerline"; we expand to 100pt before giving up on this end.
+CENTERLINE_WIDTHS_PT = (1.0, 10.0, 25.0, 50.0, 100.0)
 ML_EXCLUDE_CLASSES = ("Taxiways", "Taxiway Labels", "Runway Labels")
 
 
@@ -88,7 +94,9 @@ def _runway_axis(subpaths, fallback_rect):
 
 
 def _segment_intersects_bbox(p1, p2, x0, y0, x1, y1) -> bool:
-    """Liang-Barsky line-clipping segment-vs-axis-aligned-rect."""
+    """Liang-Barsky line-clipping segment-vs-axis-aligned-rect.
+    Currently unused; kept around in case the centerline gate needs to
+    be reintroduced later."""
     ax, ay = p1
     bx, by = p2
     dx, dy = bx - ax, by - ay
@@ -115,83 +123,133 @@ def _segment_intersects_bbox(p1, p2, x0, y0, x1, y1) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — runway-label candidates
+# Step 5 — centerline-token search and K-nearest claim
 # ---------------------------------------------------------------------------
 
-def _detect_runway_candidates(text_tokens, all_polys, claimed: set[int]):
-    """Step 3: regex + K-nearest against unclaimed near-black filled
-    glyph polygons. No centerline check here — Step 5 validates.
+def _match_runway_labels(runway_indices, all_polys, text_tokens,
+                         claimed_polys: set[int]):
+    """For each ML-predicted Runway polygon, search past each end of
+    the polygon's principal axis for a runway-pattern text token whose
+    centroid sits within a progressively-widened band along the
+    centerline (CENTERLINE_WIDTHS_PT). The first token found at the
+    smallest-width band that contains any candidate wins that end. Ties
+    inside a band are broken by closeness-to-end (longitudinal
+    distance past the endpoint).
 
-    Mutates `claimed` to include each group's polygon indices so they
-    are excluded from later steps.
+    For each matched token, claim K = len(token.text) nearest unclaimed
+    near-black filled polygons as Runway Labels. Polygons claimed for
+    one runway are not available to a later runway. Tokens used by one
+    end aren't reused at any other end.
 
-    Returns list of {token: str, indices: list[int]}.
+    Mutates `claimed_polys`.
+
+    Returns:
+      (label_indices, diagnostics)
+        label_indices: set[int] of polygon indices to label as Runway Labels
+        diagnostics:   list[dict] one per (runway, end), records what
+                       happened — token text, width that succeeded, lat
+                       offset, longitudinal distance past end, claimed
+                       polygon indices. Used by step-5 print-out.
     """
-    groups: list[dict] = []
+    # Pre-filter tokens to those matching the runway regex.
     pattern_tokens = [t for t in text_tokens if RUNWAY_RE.match(t["text"])]
-    for tok in pattern_tokens:
-        k = len(tok["text"])
-        scored = []
-        for i, p in enumerate(all_polys):
-            if i in claimed:
-                continue
-            if not (p["filled"] and p["is_near_black"]
-                    and not p["is_taxi_surface"]):
-                continue
-            dx = tok["cx"] - p["cx"]
-            dy = tok["cy"] - p["cy"]
-            scored.append((dx * dx + dy * dy, i))
-        scored.sort()
-        nearest = [i for _, i in scored[:k]]
-        if len(nearest) < k:
-            continue
-        groups.append({"token": tok["text"], "indices": nearest})
-        claimed.update(nearest)
-    return groups
+    used_token_ids: set[int] = set()    # id() of token dicts already used
+    label_indices: set[int] = set()
+    diagnostics: list[dict] = []
 
-
-# ---------------------------------------------------------------------------
-# Step 5 — centerline validation
-# ---------------------------------------------------------------------------
-
-def _validate_runway_groups(candidate_groups, runway_indices, all_polys,
-                            page_w, page_h):
-    """For each ML-predicted Runways polygon, compute an extended
-    centerline. For each candidate group, mark it 'pass' if any
-    polygon in the group has its bbox crossed by any extended
-    centerline. Otherwise 'fail'.
-
-    Returns (pass_indices: set[int], fail_indices: set[int])."""
-    centerlines = []
     for ri in runway_indices:
-        p = all_polys[ri]
-        cx, cy, ux, uy, half_len = _runway_axis(p["subpaths"], p["rect"])
-        ext = half_len + RUNWAY_CENTERLINE_PAD_PT
-        seg_p1 = (cx - ux * ext, cy - uy * ext)
-        seg_p2 = (cx + ux * ext, cy + uy * ext)
-        centerlines.append((seg_p1, seg_p2))
+        rp = all_polys[ri]
+        cx, cy, ux, uy, half_len = _runway_axis(rp["subpaths"], rp["rect"])
+        # Pre-compute per-token longitudinal/lateral coordinates for
+        # this runway.
+        tok_proj = []
+        for tok in pattern_tokens:
+            if id(tok) in used_token_ids:
+                tok_proj.append(None)
+                continue
+            dxv = tok["cx"] - cx
+            dyv = tok["cy"] - cy
+            long_pos = dxv * ux + dyv * uy
+            lat = abs(-dxv * uy + dyv * ux)
+            tok_proj.append((long_pos, lat))
 
-    pass_indices: set[int] = set()
-    fail_indices: set[int] = set()
-    n_pass_groups = 0
-    n_fail_groups = 0
-    for g in candidate_groups:
-        group_passes = False
-        for i in g["indices"]:
-            x0, y0, x1, y1 = all_polys[i]["rect"]
-            for seg_p1, seg_p2 in centerlines:
-                if _segment_intersects_bbox(seg_p1, seg_p2, x0, y0, x1, y1):
-                    group_passes = True
+        for end_sign in (-1, +1):
+            chosen = None       # (width, distance_past_end, lat, tok)
+            for width in CENTERLINE_WIDTHS_PT:
+                cands = []
+                for tok, proj in zip(pattern_tokens, tok_proj):
+                    if proj is None:
+                        continue
+                    if id(tok) in used_token_ids:
+                        continue
+                    long_pos, lat = proj
+                    # Past this endpoint along the axis.
+                    if end_sign * long_pos < half_len:
+                        continue
+                    if lat >= width / 2.0:
+                        continue
+                    dist_past = end_sign * long_pos - half_len
+                    cands.append((dist_past, lat, tok))
+                if cands:
+                    cands.sort(key=lambda x: x[0])
+                    dist_past, lat, tok = cands[0]
+                    chosen = (width, dist_past, lat, tok)
                     break
-            if group_passes:
-                break
-        if group_passes:
-            pass_indices.update(g["indices"])
-            n_pass_groups += 1
-        else:
-            fail_indices.update(g["indices"])
-            n_fail_groups += 1
-    return pass_indices, fail_indices, n_pass_groups, n_fail_groups
+            diag = {
+                "runway_idx": ri,
+                "end_sign": end_sign,
+                "matched": False,
+                "token": None,
+                "width": None,
+                "lat": None,
+                "dist_past_end": None,
+                "claimed": [],
+            }
+            if chosen is None:
+                diagnostics.append(diag)
+                continue
+            width, dist_past, lat, tok = chosen
+            used_token_ids.add(id(tok))
+            k = len(tok["text"])
+            # Claim K nearest unclaimed near-black filled polygons.
+            scored = []
+            for i, p in enumerate(all_polys):
+                if i in claimed_polys:
+                    continue
+                if not (p["filled"] and p["is_near_black"]
+                        and not p["is_taxi_surface"]):
+                    continue
+                ddx = tok["cx"] - p["cx"]
+                ddy = tok["cy"] - p["cy"]
+                scored.append((ddx * ddx + ddy * ddy, i))
+            scored.sort()
+            nearest = [i for _, i in scored[:k]]
+            if len(nearest) < k:
+                # Couldn't find enough polygons to satisfy K. Free the
+                # token so it can be considered for the next end (rare
+                # but possible at airports with very crowded glyph
+                # pools).
+                used_token_ids.discard(id(tok))
+                diag["matched"] = False
+                diag["token"] = tok["text"]
+                diag["width"] = width
+                diag["lat"] = lat
+                diag["dist_past_end"] = dist_past
+                diag["claimed"] = []
+                diag["note"] = f"insufficient_polys k={k} found={len(nearest)}"
+                diagnostics.append(diag)
+                continue
+            claimed_polys.update(nearest)
+            label_indices.update(nearest)
+            diag["matched"] = True
+            diag["token"] = tok["text"]
+            diag["width"] = width
+            diag["lat"] = lat
+            diag["dist_past_end"] = dist_past
+            diag["claimed"] = list(nearest)
+            diagnostics.append(diag)
+
+    return label_indices, diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -225,13 +283,6 @@ def main():
 
     # Claimed = removed-from-pool. Each later step adds to this set.
     claimed: set[int] = surf_set | label_set
-
-    # ---- Step 3: runway-label candidates -----------------------------
-    print(f"[pipeline] step 3: runway-label candidates")
-    runway_groups = _detect_runway_candidates(text_tokens, all_polys, claimed)
-    candidate_indices = {i for g in runway_groups for i in g["indices"]}
-    print(f"  candidate groups: {len(runway_groups)}, "
-          f"polygons: {len(candidate_indices)}")
 
     # ---- Step 4: ML on the remaining unclaimed polygons --------------
     print(f"[pipeline] step 4: ML on {len(all_polys) - len(claimed)} "
@@ -333,29 +384,33 @@ def main():
     for lab, n in counts.items():
         print(f"    {lab:<22} {n}")
 
-    # ---- Step 5: centerline validation -------------------------------
-    print(f"[pipeline] step 5: centerline validation of "
-          f"{len(runway_groups)} candidate groups")
+    # ---- Step 5: centerline-token search -----------------------------
     runway_indices = [i for j, i in enumerate(unclaimed_indices)
                       if ml_labels[j] == "Runways"]
-    print(f"  ML-predicted Runways: {len(runway_indices)} polygons")
+    print(f"[pipeline] step 5: centerline-token search over "
+          f"{len(runway_indices)} ML-predicted runways")
 
-    pass_idx, fail_idx, n_pass_groups, n_fail_groups = _validate_runway_groups(
-        runway_groups, runway_indices, all_polys, page_w, page_h,
+    # `claimed` already includes taxi surfaces + taxi labels. The
+    # K-nearest pool inside _match_runway_labels also uses this set so
+    # we never reuse a polygon that's already labeled.
+    rwy_label_idx, step5_diag = _match_runway_labels(
+        runway_indices, all_polys, text_tokens, claimed,
     )
-    print(f"  passed: {n_pass_groups} groups ({len(pass_idx)} polygons) -> Runway Labels")
-    print(f"  failed: {n_fail_groups} groups ({len(fail_idx)} polygons) -> Other")
+    n_matched_ends = sum(1 for d in step5_diag if d.get("matched"))
+    print(f"  runway ends processed: {len(step5_diag)}, "
+          f"token matches: {n_matched_ends}, "
+          f"polygons reassigned: {len(rwy_label_idx)}")
 
-    for i in pass_idx:
+    for i in rwy_label_idx:
         final_label[i] = "Runway Labels"
         final_top[i] = "Runway Labels"
         final_override[i] = True
-        final_source[i] = "rule_runway_label_passed"
-    for i in fail_idx:
-        final_label[i] = "Runway Label Rejects"
-        final_top[i] = "Runway Label Rejects"
-        final_override[i] = True
-        final_source[i] = "rule_runway_label_failed"
+        final_source[i] = "rule_runway_label_centerline"
+
+    # Stash diagnostics for the one-shot diag script and inline view.
+    args.out.with_suffix(".step5.json").write_text(
+        json.dumps(step5_diag, indent=2, default=str)
+    )
 
     # ---- Build records JSON in predict_one.py format -----------------
     records = []
@@ -399,8 +454,7 @@ def main():
 
     final_counts = pd.Series([r["label"] for r in records]).value_counts()
     print("\nFinal label distribution:")
-    extra = ["Runway Label Rejects"]
-    for lab in list(LABELS) + extra:
+    for lab in list(LABELS):
         n = int(final_counts.get(lab, 0))
         if n:
             print(f"  {lab:<22} {n}")

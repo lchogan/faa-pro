@@ -28,7 +28,12 @@ from pathlib import Path
 
 import fitz
 
-from extract_paths_fitz import _color_to_rgb, items_to_subpaths
+from extract_paths_fitz import (
+    _Bounds,
+    _color_to_rgb,
+    _is_off_artboard,
+    items_to_subpaths,
+)
 
 
 TAXIWAY_RE = re.compile(r"^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$")
@@ -125,12 +130,28 @@ def detect_taxi(pdf_path: Path) -> dict:
     page_h = float(page.rect.height)
 
     # --- 1) All drawings → polygon records.
+    # Filter identically to extract_paths_fitz so polygon indices line
+    # up with rows in <airport>_paths.csv. Without this, surf_set would
+    # point at wrong CSV rows and Taxiways layer would get stroke-only
+    # polygons.
+    artboard = _Bounds(left=0.0, top=page_h, right=page_w, bottom=0.0)
     drawings = page.get_drawings()
     all_polys: list[dict] = []
     for d in drawings:
         items = d.get("items") or []
         rect = d.get("rect")
         if not items or rect is None:
+            continue
+        subpaths = items_to_subpaths(items)
+        if not subpaths:
+            continue
+        bbox_ai = _Bounds(
+            left=float(rect.x0),
+            right=float(rect.x1),
+            top=page_h - float(rect.y0),
+            bottom=page_h - float(rect.y1),
+        )
+        if _is_off_artboard(bbox_ai, artboard):
             continue
         cx = (float(rect.x0) + float(rect.x1)) / 2.0
         cy = (float(rect.y0) + float(rect.y1)) / 2.0
@@ -147,8 +168,7 @@ def detect_taxi(pdf_path: Path) -> dict:
             "filled": filled,
             "is_taxi_surface": is_taxi_surface,
             "is_near_black": is_near_black,
-            # Always store subpaths — Step 5 needs them for ML-runway PCA.
-            "subpaths": items_to_subpaths(items),
+            "subpaths": subpaths,
         })
 
     taxi_surface_indices = [i for i, p in enumerate(all_polys)
