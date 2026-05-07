@@ -13,12 +13,30 @@
 #
 # Requires:
 #   - Python venv at faa-pro/.venv with deps installed
-#   - Trained model at faa-pro/python/runs/v24/model.lgb
+#   - Trained model at faa-pro/python/runs/v25/model.lgb
+#
+# Pipeline defaults (v1, locked 2026-05-07):
+#   --skip-hull           — concave-hull rejection is OFF in production.
+#                           Validated on ARB/APF/COS/ELM/F45/MCO/OGG/ORD;
+#                           the v25 model's morphology features handle
+#                           text/symbol rejection without it, and many
+#                           legitimate building footprints (e.g. ARB
+#                           FIRE STATION) sit outside the hull.
+#   no --footprint-threshold
+#                         — argmax decision rule. Lower thresholds
+#                           (0.10, 0.07) catch more borderline buildings
+#                           but also pull in arrow symbols on dense
+#                           charts like ORD. Pass via PIPELINE_EXTRA env
+#                           var if you want to experiment.
 
 set -euo pipefail
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$PROJECT/.venv/bin/python3"
+
+# Extra args appended to classify_pipeline.py — set by env to override.
+# Default disables hull rejection (see header comment for rationale).
+PIPELINE_EXTRA="${PIPELINE_EXTRA:---skip-hull}"
 
 # ---------------------------------------------------------------------------
 # process_one <pdf-path>
@@ -59,17 +77,18 @@ process_one() {
     echo "   ✓ extracted $path_count paths"
 
     # ------------------------------------------------------------------
-    # Step 2 — classify_pipeline.py runs the full 5-step pipeline in
-    #          order: rule-based taxi (1+2), runway-label candidates
-    #          (3), ML on remaining unclaimed (4), centerline validation
-    #          of candidates (5). ML never sees polygons claimed in
-    #          steps 1-3.
+    # Step 2 — classify_pipeline.py runs the full 6-step pipeline in
+    #          order: taxi surfaces (1), runways (2), runway+taxi
+    #          labels (3), hull rejection [SKIPPED in v1] (4), ML on
+    #          remaining unclaimed (5), stroked-only sweep (6). ML
+    #          never sees polygons claimed in steps 1-3.
     # ------------------------------------------------------------------
-    echo "   [2/3] Pipeline: 5-step classification..."
+    echo "   [2/3] Pipeline: 6-step classification..."
     "$PYTHON" "$PROJECT/python/classify_pipeline.py" \
         --paths "$paths_csv" \
         --pdf "$pdf" \
-        --out "$json_out"
+        --out "$json_out" \
+        $PIPELINE_EXTRA
 
     if [[ ! -f "$json_out" ]]; then
         echo "   ERROR: Pipeline produced no predictions JSON."

@@ -62,7 +62,6 @@ import json
 import re
 from pathlib import Path
 
-import fitz
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -70,28 +69,22 @@ import pandas as pd
 from chart_scene import read_chart
 from extract_pdf_text import (
     _normalize_designation,
-    find_known_runway_designations,
     load_nasr_runways,
 )
 from hull_filter import hull_reject
-from load import LABELS, load_features_all
-from pdf_char_override import apply_pdf_char_override
-from predict_one import extract_pdf_text_for_one
-from relational import add_relational_features, load_edges, load_pdf_text
+from load import LABELS, ML_LABELS, load_features_all
+from relational import add_relational_features, load_edges
 from runway_detection import detect_runways
 from taxi_detection import match_taxi_labels
 
 
 RUNWAY_RE = re.compile(r"^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$")
-# Step 5: centerline-band widths used to search for runway-name tokens
-# past each runway end. We walk the widths in order and stop at the
-# first width that yields a candidate. 1pt is effectively "directly on
-# the centerline"; we expand to 100pt before giving up on this end.
+# Centerline-band widths used to search for runway-name tokens past each
+# runway end. We walk the widths in order and stop at the first width that
+# yields a candidate. 1pt is effectively "directly on the centerline"; we
+# expand to 100pt before giving up on this end.
 CENTERLINE_WIDTHS_PT = (1.0, 10.0, 25.0, 50.0, 100.0)
-# Runways now come from the rule-based detector (step 3), so ML must
-# not assign them either.
-ML_EXCLUDE_CLASSES = ("Taxiways", "Taxiway Labels", "Runway Labels", "Runways")
-# Step 6 (hull rejection): classes whose polygons are exempt from the
+# Hull rejection (step 4): classes whose polygons are exempt from the
 # centroid-in-hull test. Rule-claimed and never re-tested. Labels in
 # particular can sit at chart edges (runway numbers past the threshold,
 # taxiway letters at the far end of a stub) so they must not be culled.
@@ -338,18 +331,23 @@ def main():
                     help="Source <airport>-faa.pdf")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--model", type=Path,
-                    default=Path(__file__).parent / "runs" / "v24" / "model.lgb")
+                    default=Path(__file__).parent / "runs" / "v25" / "model.lgb")
     ap.add_argument("--feature-list", type=Path,
-                    default=Path(__file__).parent / "runs" / "v24" / "feature_list.json")
+                    default=Path(__file__).parent / "runs" / "v25" / "feature_list.json")
     ap.add_argument("--nasr-rwy", type=Path,
                     default=Path(__file__).parent.parent / "data" / "nasr_apt_rwy.csv")
+    ap.add_argument("--skip-hull", action="store_true",
+                    help="Experiment toggle: skip hull rejection (step 4) entirely.")
+    ap.add_argument("--footprint-threshold", type=float, default=None,
+                    help="If set, label as Footprints whenever P(Footprints) >= threshold "
+                         "(overriding argmax). Lower = more sensitive. 0.5 ≈ argmax, "
+                         "try 0.3 or 0.2 to catch borderline buildings.")
     args = ap.parse_args()
 
-    # NASR runway designations for THIS airport. Used by step 3
-    # (centerline-token search) to identify which PDF text tokens are
+    # NASR runway designations for THIS airport. Used by the runway-label
+    # centerline-token search to identify which PDF text tokens are
     # actually runway names — rejects APF's stray "6" token (regex
-    # would accept it; NASR confirms APF runways are 5/23, 14/32,
-    # NE/SW). pdf_char_override also consumes the same set.
+    # would accept it; NASR confirms APF runways are 5/23, 14/32, NE/SW).
     airport_code = args.pdf.stem.replace("-faa", "").lower()
     nasr_runways_full = (
         load_nasr_runways(args.nasr_rwy)
@@ -411,75 +409,12 @@ def main():
     claimed |= label_set
     print(f"  taxi labels: {len(label_set)}")
 
-    # ---- Step 5: ML on the remaining unclaimed polygons --------------
-    print(f"[pipeline] step 5: ML on {len(all_polys) - len(claimed)} "
-          f"unclaimed polygons")
-    df = load_features_all(args.paths)
-    if len(df) != len(all_polys):
-        raise ValueError(
-            f"Polygon count mismatch — CSV has {len(df)}, "
-            f"PyMuPDF detected {len(all_polys)}. Both should iterate "
-            f"page.get_drawings() in the same order."
-        )
-
-    edges_csv = args.paths.with_name(args.paths.stem + "_edges" + args.paths.suffix)
-    edges_df = load_edges(edges_csv) if edges_csv.exists() else None
-
-    pdf_text_csv = args.out.with_suffix(".pdf_text.csv")
-    print(f"  extracting PDF text -> {pdf_text_csv.name}")
-    extract_pdf_text_for_one(args.pdf, args.nasr_rwy, pdf_text_csv)
-    text_df = load_pdf_text(pdf_text_csv)
-
-    df = add_relational_features(df, edges_df=edges_df, text_df=text_df)
-    df = df.reset_index(drop=True)
-
-    unclaimed_mask = np.array([i not in claimed for i in range(len(df))])
-    df_unclaimed = df[unclaimed_mask]
-
-    feature_meta = json.loads(args.feature_list.read_text())
-    feature_cols = feature_meta["feature_cols"]
-    cat_cols = feature_meta["categorical_cols"]
-    X = df_unclaimed[feature_cols].copy()
-    for c in cat_cols:
-        X[c] = X[c].astype("category")
-    booster = lgb.Booster(model_file=str(args.model))
-    probs = booster.predict(X)
-
-    # Mask classes ML must not assign. Taxiways and Taxi Labels are
-    # rule-based-only (handled in steps 1+2). Runway Labels come from
-    # step 5. Setting these to 0 forces argmax onto the remaining valid
-    # classes (Footprints / Runways / Lights / Stars / Other).
-    for cls in ML_EXCLUDE_CLASSES:
-        if cls in LABELS:
-            probs[:, LABELS.index(cls)] = 0.0
-
-    # Apply pdf_char_override on the filtered (unclaimed-only) df. This
-    # preserves the existing Lights-by-stroke detection and runway
-    # axis/text logic. Its taxi/runway-label overrides can't fire here
-    # because we already removed those polygons from the input pool.
-    df_unclaimed_r = df_unclaimed.reset_index(drop=True)
-    final_labels_unclaimed, _override_mask = apply_pdf_char_override(
-        df_unclaimed_r,
-        probs,
-        args.pdf,
-        nasr_runways=nasr_for_airport,
-        confidence=0.60,
-        verbose=False,
-    )
-    # Sanity-strip — the override shouldn't assign these classes on the
-    # filtered set, but enforce it.
-    ml_labels = [
-        ("Other" if lab in ML_EXCLUDE_CLASSES else lab)
-        for lab in final_labels_unclaimed
-    ]
-    ml_top_prob = probs.max(axis=1)
-
-    # Map: polygon index -> final label.
-    final_label = [None] * len(all_polys)
-    final_top = [None] * len(all_polys)
-    final_prob = [0.0] * len(all_polys)
-    final_override = [False] * len(all_polys)
-    final_source = [None] * len(all_polys)
+    # ---- Initialize per-polygon final labels from rule-claimed steps -
+    final_label: list[str | None] = [None] * len(all_polys)
+    final_top: list[str | None] = [None] * len(all_polys)
+    final_prob: list[float] = [0.0] * len(all_polys)
+    final_override: list[bool] = [False] * len(all_polys)
+    final_source: list[str | None] = [None] * len(all_polys)
 
     for i in surf_set:
         final_label[i] = "Taxiways"
@@ -505,6 +440,93 @@ def main():
         final_override[i] = True
         final_source[i] = "rule_runway_label_centerline"
 
+    # Stash centerline-token diagnostics from step 3 for inline view.
+    args.out.with_suffix(".step3.json").write_text(
+        json.dumps(step3_diag, indent=2, default=str)
+    )
+
+    # ---- Step 5 (was 6): concave-hull rejection BEFORE ML ------------
+    # Build a concave hull (no buffer) over the rule-claimed Runways +
+    # Taxiways' anchor points. A non-exempt polygon is demoted only
+    # when its bbox doesn't intersect the hull at all — anything that
+    # touches or overlaps the hull is kept (footprints flush with the
+    # apron edge belong here even when their centroid sits just
+    # outside). Exempt classes: Runways, Taxiways, Runway Labels, Taxi
+    # Labels — rule-trusted, and labels can legitimately sit at chart
+    # edges.
+    if args.skip_hull:
+        print(f"[pipeline] step 5: concave-hull rejection SKIPPED (--skip-hull)")
+    else:
+        print(f"[pipeline] step 5: concave-hull rejection (pre-ML)")
+        hull_candidates = [
+            i for i in range(len(all_polys))
+            if final_label[i] not in HULL_EXEMPT_CLASSES
+        ]
+        demote_idx, hull_diag = hull_reject(
+            all_polys,
+            anchor_indices=surf_set | rwy_set,
+            candidate_indices=hull_candidates,
+        )
+        print(f"  hull anchor pts: {hull_diag['n_anchor_points']}, "
+              f"area: {hull_diag['hull_area']:.0f}")
+        print(f"  candidates tested: {hull_diag['n_candidates_tested']}, "
+              f"demoted to Other: {hull_diag['n_demoted']}")
+        for i in demote_idx:
+            final_label[i] = "Other"
+            final_top[i] = "Other"
+            final_override[i] = True
+            final_source[i] = "hull_reject"
+        claimed |= demote_idx
+
+    # ---- Step 6: ML on the remaining unclaimed polygons --------------
+    print(f"[pipeline] step 6: ML on {len(all_polys) - len(claimed)} "
+          f"unclaimed polygons")
+    df = load_features_all(args.paths)
+    if len(df) != len(all_polys):
+        raise ValueError(
+            f"Polygon count mismatch — CSV has {len(df)}, "
+            f"PyMuPDF detected {len(all_polys)}. Both should iterate "
+            f"page.get_drawings() in the same order."
+        )
+
+    edges_csv = args.paths.with_name(args.paths.stem + "_edges" + args.paths.suffix)
+    edges_df = load_edges(edges_csv) if edges_csv.exists() else None
+
+    df = add_relational_features(df, edges_df=edges_df, text_df=None)
+    df = df.reset_index(drop=True)
+
+    unclaimed_mask = np.array([i not in claimed for i in range(len(df))])
+    df_unclaimed = df[unclaimed_mask]
+
+    feature_meta = json.loads(args.feature_list.read_text())
+    feature_cols = feature_meta["feature_cols"]
+    cat_cols = feature_meta["categorical_cols"]
+    model_labels = feature_meta.get("labels", list(ML_LABELS))
+    X = df_unclaimed[feature_cols].copy()
+    for c in cat_cols:
+        X[c] = X[c].astype("category")
+    booster = lgb.Booster(model_file=str(args.model))
+    probs = booster.predict(X)
+
+    # v25 emits only ML_LABELS (Footprints / Stars / Other). Default
+    # decision rule is argmax over the 3 columns; --footprint-threshold
+    # promotes any polygon with P(Footprints) >= threshold even when
+    # Other narrowly wins argmax — useful for catching borderline
+    # buildings the model isn't quite confident on.
+    ml_pred_idx = probs.argmax(axis=1)
+    ml_top_prob = probs.max(axis=1)
+    ml_labels = [model_labels[k] for k in ml_pred_idx]
+    if args.footprint_threshold is not None:
+        fp_idx = model_labels.index("Footprints")
+        promoted = 0
+        for j in range(len(ml_labels)):
+            if ml_labels[j] != "Footprints" and probs[j, fp_idx] >= args.footprint_threshold:
+                ml_labels[j] = "Footprints"
+                ml_top_prob[j] = float(probs[j, fp_idx])
+                promoted += 1
+        print(f"  --footprint-threshold {args.footprint_threshold}: "
+              f"promoted {promoted} polygons to Footprints")
+
     unclaimed_indices = list(df_unclaimed.index)
     for j, i in enumerate(unclaimed_indices):
         final_label[i] = ml_labels[j]
@@ -517,38 +539,27 @@ def main():
     for lab, n in counts.items():
         print(f"    {lab:<22} {n}")
 
-    # Stash centerline-token diagnostics from step 3 for inline view.
-    args.out.with_suffix(".step3.json").write_text(
-        json.dumps(step3_diag, indent=2, default=str)
-    )
-
-    # ---- Step 6: concave-hull rejection ------------------------------
-    # Build a concave hull (no buffer) over the rule-claimed Runways +
-    # Taxiways' anchor points. Demote any non-exempt polygon whose
-    # centroid sits outside that hull to Other. Exempt classes:
-    # Runways, Taxiways, Runway Labels, Taxi Labels — rule-trusted and
-    # labels can legitimately sit at chart edges.
-    print(f"[pipeline] step 6: concave-hull rejection")
-    hull_candidates = [
-        i for i in range(len(all_polys))
-        if final_label[i] not in HULL_EXEMPT_CLASSES
-    ]
-    demote_idx, hull_diag = hull_reject(
-        all_polys,
-        anchor_indices=surf_set | rwy_set,
-        candidate_indices=hull_candidates,
-    )
-    print(f"  hull anchor pts: {hull_diag['n_anchor_points']}, "
-          f"area: {hull_diag['hull_area']:.0f}")
-    print(f"  candidates tested: {hull_diag['n_candidates_tested']}, "
-          f"demoted to Other: {hull_diag['n_demoted']}")
-
-    for i in demote_idx:
-        prev = final_label[i]
-        final_label[i] = "Other"
-        final_top[i] = "Other"
-        final_override[i] = True
-        final_source[i] = f"hull_reject_from_{prev}"
+    # ---- Step 7 (user-facing step 6): stroked-only sweep -------------
+    # Final pass: any polygon that's stroked-only (stroked && not filled)
+    # AND not on the Runways layer is demoted to Other. Catches Lights,
+    # arrowheads, line art, decorative symbols that survive ML. Runways
+    # are exempt — grass-strip runways are drawn as stroked rectangles
+    # and must stay on the Runways layer (rule-claimed in step 2).
+    print(f"[pipeline] step 7: stroked-only sweep → Other (Runways exempt)")
+    stroked_demoted = 0
+    for i, p in enumerate(all_polys):
+        if final_label[i] == "Runways":
+            continue
+        if final_label[i] == "Other":
+            continue  # already there
+        if p.get("stroked") and not p.get("filled"):
+            prev = final_label[i]
+            final_label[i] = "Other"
+            final_top[i] = "Other"
+            final_override[i] = True
+            final_source[i] = f"stroked_sweep_from_{prev}"
+            stroked_demoted += 1
+    print(f"  stroked-only polygons demoted: {stroked_demoted}")
 
     # ---- Build records JSON in predict_one.py format -----------------
     records = []

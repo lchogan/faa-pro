@@ -106,6 +106,63 @@ def _centroid_inside_any_bbox(centroids: np.ndarray, bboxes: np.ndarray) -> np.n
     return ((cx >= left) & (cx <= right) & (cy >= bottom) & (cy <= top)).any(axis=1)
 
 
+def _add_morphology_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-polygon shape features used by the footprint classifier.
+
+    Real building footprints are mostly compact polygons with moderate
+    rectangularity and high convexity. Letter glyphs and arrowheads have
+    very different morphology: low convexity (concave), low rectangularity,
+    distinct shape index. Without these features the model relied on size +
+    fill color, which doesn't separate small letters from small sheds.
+
+    All features are derived from columns already produced by
+    extract_paths_fitz.py (poly_area, perimeter, bbox_area, hull_area,
+    num_anchors). No new dependencies needed; equivalent to the subset of
+    momepy.shape that we'd use anyway.
+
+    Features added:
+      circularity              4πA/P²              1 = circle, ~0 elongated
+      convexity                A / hull_area       1 = convex, low = concave
+      rectangularity           A / bbox_area       1 = exactly fills bbox
+      shape_index              P / (2√(πA))        1 = circle, large = jagged
+      vertex_density           num_anchors / P     anchors per perimeter unit
+      anchor_log               log(1 + num_anchors)  size-decoupled vertex count
+      hull_area_rel            hull_area / bbox_area
+    """
+    df = df.copy()
+    poly_area = df["poly_area"].fillna(0).to_numpy(dtype=float)
+    perim = df["perimeter"].fillna(0).to_numpy(dtype=float)
+    bbox_area = df["bbox_area"].fillna(0).to_numpy(dtype=float)
+    hull_area = df["hull_area"].fillna(0).to_numpy(dtype=float) if "hull_area" in df.columns else np.zeros(len(df))
+    num_anchors = df["num_anchors"].fillna(0).to_numpy(dtype=float)
+
+    # Use poly_area when positive (closed polygon), otherwise bbox_area as a
+    # geometric proxy. Open paths (lines) have poly_area=0; their morphology
+    # features are computed against bbox so they aren't all NaN — letting the
+    # model learn that "open path with 2 anchors and tiny bbox" is a Lines/
+    # arrow signature.
+    eff_area = np.where(poly_area > 1e-6, poly_area, bbox_area)
+
+    perim_safe = np.maximum(perim, 1e-6)
+    eff_area_safe = np.maximum(eff_area, 1e-6)
+    bbox_area_safe = np.maximum(bbox_area, 1e-6)
+
+    df["circularity"] = 4.0 * np.pi * eff_area / (perim_safe ** 2)
+    df["convexity"] = np.where(hull_area > 1e-6, poly_area / np.maximum(hull_area, 1e-6), 0.0)
+    df["rectangularity"] = poly_area / bbox_area_safe
+    df["shape_index"] = perim / (2.0 * np.sqrt(np.pi * eff_area_safe))
+    df["vertex_density"] = num_anchors / perim_safe
+    df["anchor_log"] = np.log1p(num_anchors)
+    df["hull_area_rel"] = np.where(bbox_area > 1e-6, hull_area / bbox_area_safe, 0.0)
+
+    # Cap circularity at 1.5 — beyond that is numerical artifact (poly_area
+    # > π/4 * P² is geometrically impossible). Same for convexity > 1.05.
+    df["circularity"] = df["circularity"].clip(0.0, 1.5)
+    df["convexity"] = df["convexity"].clip(0.0, 1.05)
+    df["rectangularity"] = df["rectangularity"].clip(0.0, 1.05)
+    return df
+
+
 def _per_airport(
     df: pd.DataFrame,
     edges_df: pd.DataFrame | None = None,
@@ -115,6 +172,8 @@ def _per_airport(
     n = len(df)
     if n == 0:
         return df
+
+    df = _add_morphology_features(df)
 
     centroids = df[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
     angles_rad = df["principal_angle"].to_numpy(dtype=float) * np.pi / 180.0

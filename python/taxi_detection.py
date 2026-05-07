@@ -67,27 +67,22 @@ def _point_in_subpaths(x: float, y: float,
 
 
 def _bbox_touches(t: dict, surfaces: list[dict]) -> bool:
-    """True if the token bbox has any spatial overlap with any surface
-    polygon. 5-sample point-in-polygon plus a check for surface
-    anchors inside the token bbox catches partial overlap without a
-    full edge-intersection test."""
-    sample = [
-        (t["cx"], t["cy"]),
-        (t["x0"], t["y0"]), (t["x1"], t["y0"]),
-        (t["x1"], t["y1"]), (t["x0"], t["y1"]),
-    ]
+    """True if the token's center sits inside any surface polygon.
+
+    Earlier this was a 5-sample bbox-corners test; OGG showed it was
+    too lenient — a runway-slope annotation like "UP" painted just off
+    pavement still passed because its bbox corners reached into the
+    adjacent taxiway. Real taxi-letter labels are painted *on* the
+    pavement, so requiring the centroid to be inside is both more
+    conservative and more semantically correct.
+    """
+    cx, cy = t["cx"], t["cy"]
     for s in surfaces:
         sx0, sy0, sx1, sy1 = s["rect"]
-        if sx1 < t["x0"] or sx0 > t["x1"] or sy1 < t["y0"] or sy0 > t["y1"]:
+        if not (sx0 <= cx <= sx1 and sy0 <= cy <= sy1):
             continue
-        subs = s["subpaths"] or []
-        for px, py in sample:
-            if _point_in_subpaths(px, py, subs):
-                return True
-        for ring in subs:
-            for ax, ay in ring:
-                if t["x0"] <= ax <= t["x1"] and t["y0"] <= ay <= t["y1"]:
-                    return True
+        if _point_in_subpaths(cx, cy, s["subpaths"] or []):
+            return True
     return False
 
 

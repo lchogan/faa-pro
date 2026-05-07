@@ -33,7 +33,6 @@ from extract_paths_fitz import (
 
 TARGET_LAYERS = [
     "PDF Text Tokens",
-    "Lights",
     "Footprints",
     "Runways",
     "Runway Labels",

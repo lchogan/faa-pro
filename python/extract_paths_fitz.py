@@ -45,6 +45,8 @@ import numpy as np
 from scipy.spatial import ConvexHull
 from scipy.spatial import QhullError
 
+from load import UNLABELED, layer_name_to_label
+
 
 CSV_COLUMNS = [
     "airport", "object_id", "kind", "source_layer", "label",
@@ -292,10 +294,33 @@ def _is_off_artboard(b: _Bounds, ab: _Bounds) -> bool:
     )
 
 
+def _force_all_layers_visible(doc: fitz.Document) -> None:
+    """Enable every OCG UI config so get_drawings() returns hidden layers too.
+
+    Critical for labeled .ai files: the user's clean corpus saves them with
+    Other / Uncertain / Lines / Text / Arrowheads layers turned OFF in the UI
+    config (so the file *displays* as a clean diagram). PyMuPDF respects that
+    visibility and silently drops their drawings, which would discard the
+    bulk of the negative-class training data. action=0 = "set to visible".
+    No-op for source PDFs that have no OCG layers at all.
+    """
+    try:
+        configs = doc.layer_ui_configs()
+    except Exception:
+        return
+    for c in configs:
+        try:
+            doc.set_layer_ui_config(c["number"], action=0)
+        except Exception:
+            # Some configs are radio-group-locked; skip silently.
+            pass
+
+
 def extract_paths(pdf_path: Path, airport: str) -> tuple[list[dict], list[dict]]:
     """Return (path rows, edge rows) for the first page of pdf_path."""
     doc = fitz.open(pdf_path)
     try:
+        _force_all_layers_visible(doc)
         page = doc[0]
         page_h = float(page.rect.height)
         page_w = float(page.rect.width)
@@ -312,6 +337,14 @@ def extract_paths(pdf_path: Path, airport: str) -> tuple[list[dict], list[dict]]
     object_id = 0
 
     drawings = page.get_drawings()
+    # Labeled mode: this AI/PDF carries OCG layer info on at least one
+    # drawing. In that case, drawings without a layer field were left in
+    # Layer 1 (the unclassified holding tank) and get UNLABELED — they
+    # should be excluded from training, not lumped into the Other negative
+    # class. Source FAA PDFs have no OCG layers at all; every drawing comes
+    # back with layer=None and we emit source_layer="" / label=UNLABELED so
+    # the inference path doesn't accidentally treat them as training data.
+    has_layer_info = any(d.get("layer") for d in drawings)
     for d in drawings:
         items = d.get("items", [])
         if not items:
@@ -322,6 +355,20 @@ def extract_paths(pdf_path: Path, airport: str) -> tuple[list[dict], list[dict]]
         if not sps_pdf:
             continue
         sps_ai = [[(x, page_h - y) for (x, y) in sp] for sp in sps_pdf]
+
+        # Layer / label. PyMuPDF surfaces the OCG layer name as d['layer']
+        # for drawings that came from a layered AI/PDF (None for source FAA
+        # PDFs, which have no layers). When present, map it to a canonical
+        # training label via load.layer_name_to_label.
+        raw_layer = d.get("layer") or ""
+        if raw_layer:
+            label = layer_name_to_label(raw_layer)
+        elif has_layer_info:
+            # Labeled file but this drawing was left in Layer 1.
+            raw_layer = "Layer 1"
+            label = UNLABELED
+        else:
+            label = UNLABELED
 
         # Bbox: trust PyMuPDF's reported rect (it accounts for Bezier curves).
         rect = d.get("rect")
@@ -403,8 +450,8 @@ def extract_paths(pdf_path: Path, airport: str) -> tuple[list[dict], list[dict]]
             "airport": airport,
             "object_id": object_id,
             "kind": kind,
-            "source_layer": "",
-            "label": "UNLABELED",
+            "source_layer": raw_layer,
+            "label": label,
             "left": round(bbox.left, 4),
             "top": round(bbox.top, 4),
             "right": round(bbox.right, 4),

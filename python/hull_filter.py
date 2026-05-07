@@ -2,11 +2,17 @@
 hull_filter.py — concave-hull rejection (step 4 of the six-step plan).
 
 Build a concave hull over the union of rule-claimed Runway and Taxiway
-polygons' anchor points. Any candidate polygon whose centroid sits
-outside that hull is demoted to Other. The caller is responsible for
-excluding exempt classes (Runways, Taxiways, Runway Labels, Taxi
-Labels) from the candidate set — the user's plan exempts them because
-they're rule-claimed and labels can legitimately sit at chart edges.
+polygons' anchor points. A candidate polygon is kept if its bounding
+box *intersects* the hull (touches or overlaps); it is demoted to Other
+only when the entire polygon sits fully outside the hull. The caller is
+responsible for excluding exempt classes (Runways, Taxiways, Runway
+Labels, Taxi Labels) from the candidate set — they're rule-claimed and
+labels can legitimately sit at chart edges.
+
+The bbox-intersects test (vs. the older centroid-in-hull test) keeps
+footprints that straddle the hull boundary — buildings flush with
+runway/apron edges where the centroid happens to land just outside the
+concave wrap.
 
 No buffer is applied: the hull is the tightest valid concave wrap
 around the airport's runway/taxi network. shapely.concave_hull with
@@ -20,7 +26,7 @@ Public API:
 from __future__ import annotations
 
 import shapely
-from shapely.geometry import MultiPoint, Point
+from shapely.geometry import MultiPoint, box
 
 
 def _collect_anchor_points(
@@ -54,8 +60,8 @@ def hull_reject(
 
     Returns:
         (demote_indices, diag). demote_indices is a set of indices
-        whose centroid sits outside the hull. diag carries hull stats
-        for the pipeline's print-out.
+        whose bounding box does not intersect the hull. diag carries
+        hull stats for the pipeline's print-out.
     """
     pts = _collect_anchor_points(all_polys, anchor_indices)
     diag: dict = {
@@ -80,11 +86,15 @@ def hull_reject(
     diag["hull_area"] = float(hull.area)
     diag["n_candidates_tested"] = len(candidates)
 
-    demote: set[int] = set()
-    for i in candidates:
-        p = all_polys[i]
-        if not hull.covers(Point(p["cx"], p["cy"])):
-            demote.add(i)
+    # shapely 2 vectorizes intersects across an array of geometries,
+    # which is much faster than a per-iter Python call.
+    rects = [all_polys[i]["rect"] for i in candidates]
+    bboxes = [
+        box(min(r[0], r[2]), min(r[1], r[3]), max(r[0], r[2]), max(r[1], r[3]))
+        for r in rects
+    ]
+    keep_mask = shapely.intersects(hull, bboxes) if bboxes else []
+    demote: set[int] = {i for i, keep in zip(candidates, keep_mask) if not keep}
     diag["n_demoted"] = len(demote)
     return demote, diag
 
