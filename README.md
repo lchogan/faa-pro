@@ -43,7 +43,8 @@ scripting in the production path.
 ### `classify_pipeline.py` — the 5 substeps
 
 Polygons claimed in earlier substeps are **removed from the pool** seen
-by every later substep. ML never decides Taxiways or Taxiway Labels.
+by every later substep. ML never decides Taxiways, Taxiway Labels, or
+Runways.
 
 1. **Taxiways (rule-based).** Filled polygons whose RGB is gray
    (~#cfcfcf with leeway: avg 175–235, channel spread ≤ 20). This is
@@ -56,19 +57,30 @@ by every later substep. ML never decides Taxiways or Taxiway Labels.
    filled polygons (the actual glyph polygons) are claimed as
    Taxiway Labels.
 
-3. **(no step 3 — placeholder for the deferred runway-label
-   pre-claim that we removed; see step 5).**
+3. **Runways (rule-based, NASR-driven).** Look up the airport in
+   `data/nasr_apt_rwy.csv`, count its non-helipad runways → `N`. From
+   the unclaimed pool, take the `N` largest polygons by polygon area
+   (shoelace, robust to rotation) that are either filled near-black
+   (paved) or stroked-only (grass strip outlines). Two safeguards:
+   a bbox-area smell test (≤ 50% of page) rejects the chart frame,
+   and a PCA-derived aspect-ratio sanity check (≥ 20% of the
+   airport's smallest NASR runway aspect, floor 4:1) rejects label
+   boxes whose polygon area might rival a small runway. Nested clip
+   groups exposed by `get_drawings(extended=True)` are also
+   candidates; when a clip wins, the largest polygon fully contained
+   in its scissor is claimed (this is how F45's grass strip — drawn
+   only as a clipped hatch pattern — gets picked up).
 
-4. **ML — Footprints, Runways, Lights, Stars, Other.** The trained
-   LightGBM model (`python/runs/v24/model.lgb`) runs on every polygon
-   *not* claimed by step 1 or 2. The Taxiways / Taxiway Labels /
-   Runway Labels classes are masked out of the probability matrix so
-   an unclaimed polygon can't fall back into them. The existing
-   `pdf_char_override.apply_pdf_char_override` runs on the filtered
-   set, preserving the Lights-by-stroke heuristic that detects ~1000
-   light-fixture stripes.
+4. **ML — Footprints, Lights, Stars, Other.** The trained LightGBM
+   model (`python/runs/v24/model.lgb`) runs on every polygon *not*
+   claimed by step 1, 2, or 3. The Taxiways / Taxiway Labels /
+   Runways / Runway Labels classes are masked out of the probability
+   matrix so an unclaimed polygon can't fall back into them. The
+   existing `pdf_char_override.apply_pdf_char_override` runs on the
+   filtered set, preserving the Lights-by-stroke heuristic that
+   detects ~1000 light-fixture stripes.
 
-5. **Runway Labels (rule-based, post-ML).** For each ML-predicted
+5. **Runway Labels (rule-based, post-ML).** For each rule-claimed
    Runway polygon, compute its principal axis via PCA. From each
    endpoint, search outward through widths `(1, 10, 25, 50, 100)pt`
    for any runway-pattern (`^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$`)
@@ -93,7 +105,9 @@ faa-pro/
 │   ├── classify_pipeline.py             # 5-step orchestrator (Step 2)
 │   ├── extract_paths_fitz.py            # PyMuPDF path extraction (Step 1)
 │   ├── render_svg_layers.py             # SVG export (Step 3)
+│   ├── chart_scene.py                   # PDF → polygons + clips + tokens (single source of truth)
 │   ├── taxi_detection.py                # rule-based taxi (steps 1+2 of pipeline)
+│   ├── runway_detection.py              # rule-based runway (step 3 of pipeline, NASR-driven)
 │   ├── pdf_char_override.py             # Lights heuristic + axis helpers
 │   ├── relational.py                    # ML feature engineering
 │   ├── load.py                          # CSV schema + LABELS tuple
@@ -131,18 +145,32 @@ geometric features won't match what it sees at inference time.
   proprietary undocumented Illustrator serialization) to map OCGs to
   native layers. The SVG importer doesn't need that, so SVG is the
   practical path.
-- **Why no Step 3 pre-claim.** An earlier version of step 3 had each
-  runway-pattern token greedily claim K nearest polygons before ML
-  ran, validated against centerlines after. False positives from
-  bare-digit tokens (`1`, `2`, `3`) grabbed unrelated glyphs that
-  happened to lie near a centerline. The current centerline-token
-  search anchors on the runways themselves and picks at most one
-  token per runway end, eliminating that whole class of error.
-- **Why ML can't decide Taxiways or Taxi Labels.** The rule-based
-  detection is more reliable: gray fill is unambiguous, and the
-  K-nearest token-driven match is essentially perfect on diagrams
-  where labels sit on pavement. Letting ML override that would only
+- **Why ML can't decide Taxiways, Taxi Labels, or Runways.** The
+  rule-based detection is more reliable: gray fill is unambiguous,
+  the K-nearest token-driven match is essentially perfect on
+  diagrams where labels sit on pavement, and NASR tells us exactly
+  how many runways an airport has so picking the N largest polygons
+  is more robust than ML when the chart's runway depiction varies
+  (paved black-fill, grass strip stroked outline, nested clip group
+  with hatch pattern only). Letting ML override these would only
   introduce errors.
+- **Why nested clip groups are first-class candidates in step 3.**
+  Some FAA charts (F45 is the canonical example) draw a grass-strip
+  runway as a clipped hatch pattern with no visible outline polygon.
+  The simple-rectangle outline you see in Illustrator is the
+  clip-group's clipping shape, which `page.get_drawings()` hides by
+  default. Switching to `get_drawings(extended=True)` exposes
+  `clip`-typed entries; `chart_scene.py` carries them alongside
+  regular polygons, and `runway_detection.py` ranks them as
+  candidates. When a clip wins, the largest polygon fully contained
+  in its scissor is claimed.
+- **Why an aspect-ratio sanity check.** A label-box rectangle on a
+  small chart can have polygon area comparable to a 1850ft turf
+  strip. NASR's per-airport minimum runway aspect (length/width)
+  gives us a per-chart threshold: candidates must be at least 20% as
+  elongated as the most square-ish real runway, floor 4:1. PCA on
+  polygon points is used so rotated rectangles don't get punished
+  by their square bboxes.
 - **Why centerline-based runway-label matching is a thin band, not a
   bbox-touch test.** Runway designators on FAA charts often sit at
   the threshold *off* the runway pavement. A bbox-touch test against
@@ -151,12 +179,38 @@ geometric features won't match what it sees at inference time.
 
 ## Known limitations
 
-- ML sometimes misses parallel runways (ORD detected 6 of 8). When a
-  runway pavement isn't predicted, its labels can't be matched in
-  step 5 and stay as whatever ML assigned them (usually Other).
-  Improving runway recall in the model would close this.
 - The PDF Text Tokens debug layer adds ~700 text frames per chart.
   Toggle it off in Illustrator if it gets in the way.
+- The remaining ML class — `Footprints` vs `Other` — still has the
+  same false-positive issues as before (filled circles, arrowheads,
+  letter polygons leaking into Footprints). The plan to refactor
+  this with momepy morphology features and the combined 30+125-file
+  training corpus is captured in memory but not yet implemented.
+
+## Pipeline status (six-step plan)
+
+The user's six-step plan for the rebuilt pipeline:
+
+1. **Taxiways → gray fill.** Done (pre-rebuild rule).
+2. **Runways → deterministic.** Done — NASR-driven top-N rule with
+   nested clip-group support and aspect-ratio sanity check.
+   Validated on ARB, APF, ELM, F45.
+3. **Taxiway and runway labels.** Done — taxi labels via
+   step-2 K-nearest, runway labels via centerline-token search
+   (now consumes step 3's rule-claimed runways).
+4. **Concave hull rejection.** Not started. Build a concave hull
+   over runways + taxiways, reject any unclaimed polygon whose
+   centroid sits outside it (no buffer; runways/taxiways/labels
+   exempt).
+5. **Footprint ML refactor.** Not started. Train footprint binary
+   on the union of the 30 clean files plus the 125 NASR-matched
+   airports from the legacy 160-file corpus (international airports
+   excluded — sourced from OSM, different stylization). Plan: use
+   momepy morphology features + relational signals; keep stroked
+   items in this pass for context.
+6. **Stroked → Other.** Not started. Final sweep moves stroked
+   items to Other, with the Runways layer exempt (grass strips
+   stay).
 
 ## Commit history (rebuild)
 

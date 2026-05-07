@@ -7,12 +7,18 @@ from the pool seen by every later step.
   1+2. Taxiways / Taxi Labels    rule-based (gray-fill detection +
                                  token regex K-nearest gated on
                                  bbox-touches-taxi-surface).
+  3.   Runways                    rule-based (NASR runway count +
+                                  top-N polygons by polygon area among
+                                  filled-near-black or stroked
+                                  candidates, after taxi removal).
+                                  Replaces ML-based runway prediction.
   4.   ML                         on the remaining unclaimed polygons.
                                   Classes Taxiways / Taxiway Labels /
-                                  Runway Labels are masked out of ML's
-                                  probability matrix so an unclaimed
-                                  polygon can't fall back into them.
-  5.   Centerline-token search    For each ML-predicted Runway, extend
+                                  Runway Labels / Runways are masked
+                                  out of ML's probability matrix so an
+                                  unclaimed polygon can't fall back
+                                  into them.
+  5.   Centerline-token search    For each rule-claimed Runway, extend
                                   a thin centerline past each end. The
                                   closest runway-pattern text token
                                   whose centroid sits within a
@@ -53,6 +59,7 @@ from load import LABELS, load_features_all
 from pdf_char_override import apply_pdf_char_override
 from predict_one import extract_pdf_text_for_one
 from relational import add_relational_features, load_edges, load_pdf_text
+from runway_detection import detect_runways
 from taxi_detection import detect_taxi
 
 
@@ -62,7 +69,9 @@ RUNWAY_RE = re.compile(r"^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$")
 # first width that yields a candidate. 1pt is effectively "directly on
 # the centerline"; we expand to 100pt before giving up on this end.
 CENTERLINE_WIDTHS_PT = (1.0, 10.0, 25.0, 50.0, 100.0)
-ML_EXCLUDE_CLASSES = ("Taxiways", "Taxiway Labels", "Runway Labels")
+# Runways now come from the rule-based detector (step 3), so ML must
+# not assign them either.
+ML_EXCLUDE_CLASSES = ("Taxiways", "Taxiway Labels", "Runway Labels", "Runways")
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +293,16 @@ def main():
     # Claimed = removed-from-pool. Each later step adds to this set.
     claimed: set[int] = surf_set | label_set
 
+    # ---- Step 3: rule-based runway detection -------------------------
+    airport_code = args.pdf.stem.replace("-faa", "").lower()
+    print(f"[pipeline] step 3: rule-based runway detection ({airport_code})")
+    rwy_set = detect_runways(
+        all_polys, det["clips"], airport_code, args.nasr_rwy,
+        page_w=page_w, page_h=page_h, claimed_indices=claimed,
+    )
+    print(f"  runways: {len(rwy_set)}")
+    claimed |= rwy_set
+
     # ---- Step 4: ML on the remaining unclaimed polygons --------------
     print(f"[pipeline] step 4: ML on {len(all_polys) - len(claimed)} "
           f"unclaimed polygons")
@@ -372,6 +391,12 @@ def main():
         final_override[i] = True
         final_source[i] = "rule_taxi_label"
 
+    for i in rwy_set:
+        final_label[i] = "Runways"
+        final_top[i] = "Runways"
+        final_override[i] = True
+        final_source[i] = "rule_runway_nasr_topn"
+
     unclaimed_indices = list(df_unclaimed.index)
     for j, i in enumerate(unclaimed_indices):
         final_label[i] = ml_labels[j]
@@ -385,10 +410,10 @@ def main():
         print(f"    {lab:<22} {n}")
 
     # ---- Step 5: centerline-token search -----------------------------
-    runway_indices = [i for j, i in enumerate(unclaimed_indices)
-                      if ml_labels[j] == "Runways"]
+    # Runway polygons now come from step 3 (rule-based), not ML.
+    runway_indices = sorted(rwy_set)
     print(f"[pipeline] step 5: centerline-token search over "
-          f"{len(runway_indices)} ML-predicted runways")
+          f"{len(runway_indices)} rule-claimed runways")
 
     # `claimed` already includes taxi surfaces + taxi labels. The
     # K-nearest pool inside _match_runway_labels also uses this set so
