@@ -12,13 +12,22 @@ Output layers:
                         <text> per word, anchored at bbox center.
 
 Label matching:
-  A token qualifies as a taxiway-label candidate if:
-    (a) its text matches `^[A-Z][A-Z]?[0-9]?$` (e.g. "C", "C1", "YY2"), and
-    (b) its bbox centroid lies inside a Taxiway-surface polygon.
+  A token qualifies as a label candidate if:
+    (a) its text matches the class pattern, and
+    (b) its bbox touches (any overlap with) a surface of the same class.
   For each qualifying token, the K = len(token) nearest unclaimed
-  non-surface polygon centroids are reassigned to the Taxiway-Labels
-  layer. Greedy by token-iteration order; a polygon is claimed at
-  most once.
+  candidate polygon centroids are reassigned to the Labels layer.
+
+  Patterns:
+    Runway:  ^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$  ("9", "27R", "10L")
+    Taxiway: ^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$     ("C", "C1", "A11", "3")
+
+  Runway matching runs first, so a single-digit token that sits on a
+  runway is claimed as a runway label before the taxiway pass.
+
+Output layers (SVG <g> with inkscape:groupmode="layer"):
+  Taxiways, Runways, Polygons, Taxiway Labels, Runway Labels,
+  PDF Text Tokens.
 
 Usage:
     python render_char_layers_charbox.py \\
@@ -34,19 +43,30 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import fitz
+import numpy as np
 
 from extract_paths_fitz import _color_to_rgb, items_to_subpaths
 
 
 TAXIWAY_RE = re.compile(r"^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$")
-LABEL_FILL = "#ff0000"
-SURFACE_FILL = "#cfcfcf"
+RUNWAY_RE = re.compile(r"^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$")
+TAXI_LABEL_FILL = "#ff0000"
+RUNWAY_LABEL_FILL = "#0000ff"
 # Gray-fill detection bracket around #cfcfcf = (207, 207, 207).
 GRAY_MIN = 175
 GRAY_MAX = 235
 GRAY_CHANNEL_TOL = 20  # max R/G/B spread to still call it "gray"
 # Near-black fill bracket — glyph polygons are essentially pure black.
 BLACK_MAX = 60
+# Runway pavement is a large, elongated, near-black filled polygon —
+# elongation rules out terminal aprons / parking blocks that are also
+# large + black-filled.
+RUNWAY_SURFACE_AREA_MIN = 500.0
+RUNWAY_SURFACE_ASPECT_MIN = 5.0
+# Step-3 extended centerline matching: a polygon is a runway-label
+# candidate if its bbox intersects a runway centerline extended past
+# the runway endpoints by RUNWAY_CENTERLINE_PAD_PT on each side.
+RUNWAY_CENTERLINE_PAD_PT = 80.0
 
 
 def _items_to_svg_d(items) -> str:
@@ -128,6 +148,80 @@ def _is_taxiway_gray(fill_rgb_kind) -> bool:
     return GRAY_MIN <= avg <= GRAY_MAX
 
 
+def _pca_principal_ratio(subpaths) -> float:
+    """Ratio of principal-axis singular values for the polygon's anchor
+    points. Long thin shapes have ratio >> 1 even when rotated, where
+    bbox aspect would be ~1."""
+    pts: list[tuple[float, float]] = []
+    for ring in subpaths or []:
+        pts.extend(ring)
+    if len(pts) < 3:
+        return 1.0
+    arr = np.asarray(pts, dtype=float)
+    centered = arr - arr.mean(axis=0)
+    _, sv, _ = np.linalg.svd(centered, full_matrices=False)
+    if len(sv) < 2 or sv[1] < 1e-9:
+        return float("inf")
+    return float(sv[0] / sv[1])
+
+
+def _runway_axis_from_subpaths(subpaths, fallback_rect):
+    """Compute the runway centerline geometry via PCA on the surface's
+    anchor points. Returns dict with cx, cy, ux, uy (unit direction),
+    half_len (longitudinal half-extent of the polygon along the axis).
+    Falls back to bbox long-axis if PCA can't run."""
+    pts: list[tuple[float, float]] = []
+    for ring in subpaths or []:
+        pts.extend(ring)
+    x0, y0, x1, y1 = fallback_rect
+    if len(pts) < 3:
+        if (x1 - x0) >= (y1 - y0):
+            return {"cx": (x0 + x1) / 2, "cy": (y0 + y1) / 2,
+                    "ux": 1.0, "uy": 0.0, "half_len": (x1 - x0) / 2}
+        return {"cx": (x0 + x1) / 2, "cy": (y0 + y1) / 2,
+                "ux": 0.0, "uy": 1.0, "half_len": (y1 - y0) / 2}
+    arr = np.asarray(pts, dtype=float)
+    centroid = arr.mean(axis=0)
+    centered = arr - centroid
+    # Principal axis direction = first right-singular vector of centered.
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    direction = vt[0]
+    # Normalize defensively (svd already gives unit vectors).
+    norm = float(np.linalg.norm(direction)) or 1.0
+    ux, uy = float(direction[0]) / norm, float(direction[1]) / norm
+    proj = centered @ np.array([ux, uy])
+    half_len = float((proj.max() - proj.min()) / 2.0)
+    return {"cx": float(centroid[0]), "cy": float(centroid[1]),
+            "ux": ux, "uy": uy, "half_len": half_len}
+
+
+def _segment_intersects_bbox(p1, p2, x0, y0, x1, y1) -> bool:
+    """Liang-Barsky line-clipping segment-vs-axis-aligned-rect test."""
+    ax, ay = p1
+    bx, by = p2
+    dx, dy = bx - ax, by - ay
+    p_arr = (-dx, dx, -dy, dy)
+    q_arr = (ax - x0, x1 - ax, ay - y0, y1 - ay)
+    u1, u2 = 0.0, 1.0
+    for pi, qi in zip(p_arr, q_arr):
+        if abs(pi) < 1e-12:
+            if qi < 0:
+                return False
+        else:
+            u = qi / pi
+            if pi < 0:
+                if u > u2:
+                    return False
+                if u > u1:
+                    u1 = u
+            else:
+                if u < u1:
+                    return False
+                if u < u2:
+                    u2 = u
+    return u1 <= u2
+
+
 def _point_in_subpaths(x: float, y: float,
                        subpaths: list[list[tuple[float, float]]]) -> bool:
     """Even-odd ray-cast test against a compound polygon's anchor rings.
@@ -177,12 +271,31 @@ def main():
         filled = "f" in dtype
         stroked = "s" in dtype
         fill_rgb = _color_to_rgb(d.get("fill")) if filled else ("", "", "", "none")
-        is_surface = filled and _is_taxiway_gray(fill_rgb)
-        # Match candidate: filled (not stroke-only), near-black fill,
-        # and not itself a taxiway surface.
-        is_candidate = (
-            filled and not is_surface and _is_near_black(fill_rgb)
-        )
+        rw = float(rect.x1) - float(rect.x0)
+        rh = float(rect.y1) - float(rect.y0)
+        area = max(rw * rh, 0.0)
+        long_side = max(rw, rh)
+        short_side = max(min(rw, rh), 1e-6)
+        bbox_aspect = long_side / short_side
+        is_taxi_surface = filled and _is_taxiway_gray(fill_rgb)
+        is_near_black = filled and _is_near_black(fill_rgb)
+        # Runway pavement: large + near-black + elongated. We accept if
+        # *either* bbox aspect is high (axis-aligned runway) OR PCA
+        # principal-ratio is high (diagonal runway). This rules out big
+        # black blocks (terminal aprons / parking ramps) that are large
+        # but roughly square in both bbox AND PCA terms.
+        runway_subs = items_to_subpaths(items) if (
+            is_near_black and not is_taxi_surface
+            and area >= RUNWAY_SURFACE_AREA_MIN
+        ) else None
+        is_runway_surface = False
+        if runway_subs is not None:
+            if bbox_aspect >= RUNWAY_SURFACE_ASPECT_MIN:
+                is_runway_surface = True
+            else:
+                pca_ratio = _pca_principal_ratio(runway_subs)
+                is_runway_surface = pca_ratio >= RUNWAY_SURFACE_ASPECT_MIN
+        is_surface = is_taxi_surface or is_runway_surface
         record = {
             "d": _items_to_svg_d(items),
             "fill": _color_to_hex(d.get("fill")) if filled else None,
@@ -192,14 +305,25 @@ def main():
             "cy": cy,
             "rect": (float(rect.x0), float(rect.y0),
                      float(rect.x1), float(rect.y1)),
-            "is_surface": is_surface,
-            "is_candidate": is_candidate,
-            "subpaths": items_to_subpaths(items) if is_surface else None,
+            "filled": filled,
+            "is_taxi_surface": is_taxi_surface,
+            "is_runway_surface": is_runway_surface,
+            "is_near_black": is_near_black,
+            # Subpaths are needed only for surfaces (point-in-polygon
+            # test for taxi-touch, PCA centerline for runway).
+            "subpaths": (
+                runway_subs if is_runway_surface
+                else items_to_subpaths(items) if is_taxi_surface
+                else None
+            ),
         }
         all_polys.append(record)
-    surface_polys = [p for p in all_polys if p["is_surface"]]
+
+    taxi_surfaces = [p for p in all_polys if p["is_taxi_surface"]]
+    runway_surfaces = [p for p in all_polys if p["is_runway_surface"]]
     print(f"[charbox] {len(all_polys)} polygons "
-          f"({len(surface_polys)} taxiway-surface)")
+          f"({len(taxi_surfaces)} taxi-surface, "
+          f"{len(runway_surfaces)} runway-surface)")
 
     # --- 2) PDF text tokens (word-level: "RWY", "22L", etc.)
     words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,wno)
@@ -218,14 +342,13 @@ def main():
     doc.close()
     print(f"[charbox] {len(text_tokens)} text tokens")
 
-    # --- 3) Taxiway-label matching.
+    # --- 3) Label matching.
     # A token qualifies if its bbox *touches* (has any overlap with) a
-    # taxiway surface polygon — not full containment. K-nearest is
-    # computed against candidate polygons only (filled, near-black,
-    # non-surface).
-    pattern_tokens = [t for t in text_tokens if TAXIWAY_RE.match(t["text"])]
+    # surface of the same class. K-nearest is computed against candidate
+    # polygons only (filled, non-surface; taxiway adds a near-black
+    # constraint, runway labels can be near-black or near-white).
 
-    def _bbox_touches_any_surface(t):
+    def _bbox_touches(t, surfaces):
         # 5-point sample of token bbox + check if any surface anchor
         # falls inside the bbox. Together this catches almost any
         # overlap between a small token bbox and a surface polygon
@@ -235,9 +358,8 @@ def main():
             (t["x0"], t["y0"]), (t["x1"], t["y0"]),
             (t["x1"], t["y1"]), (t["x0"], t["y1"]),
         ]
-        for s in surface_polys:
+        for s in surfaces:
             sx0, sy0, sx1, sy1 = s["rect"]
-            # Reject when surface bbox can't possibly overlap token bbox.
             if sx1 < t["x0"] or sx0 > t["x1"] or sy1 < t["y0"] or sy0 > t["y1"]:
                 continue
             subs = s["subpaths"] or []
@@ -250,39 +372,104 @@ def main():
                         return True
         return False
 
-    qualifying_tokens = [t for t in pattern_tokens if _bbox_touches_any_surface(t)]
-    print(f"[charbox] {len(pattern_tokens)} taxi-pattern tokens, "
-          f"{len(qualifying_tokens)} with bbox touching a taxiway surface")
-
-    n_candidates = sum(1 for p in all_polys if p["is_candidate"])
-    print(f"[charbox] {n_candidates} match-eligible polygons "
-          f"(filled, near-black, non-surface)")
-
-    claimed: set[int] = set()
-    label_indices: list[int] = []
-    for tok in qualifying_tokens:
-        k = len(tok["text"])
-        scored = []
-        for i, p in enumerate(all_polys):
-            if i in claimed or not p["is_candidate"]:
+    def _run_match(name, tokens, surfaces, candidate_pred,
+                   claimed_polys, claimed_token_keys):
+        """Greedy K-nearest matching for one label class. Mutates
+        claimed_polys and claimed_token_keys."""
+        label_indices: list[int] = []
+        qualifying: list[dict] = []
+        for tok in tokens:
+            tok_key = (tok["text"], round(tok["cx"], 3), round(tok["cy"], 3))
+            if tok_key in claimed_token_keys:
                 continue
-            dx = tok["cx"] - p["cx"]
-            dy = tok["cy"] - p["cy"]
-            scored.append((dx * dx + dy * dy, i))
-        scored.sort()
-        for _, i in scored[:k]:
-            claimed.add(i)
-            label_indices.append(i)
+            if not _bbox_touches(tok, surfaces):
+                continue
+            qualifying.append(tok)
+            claimed_token_keys.add(tok_key)
+            k = len(tok["text"])
+            scored = []
+            for i, p in enumerate(all_polys):
+                if i in claimed_polys or not candidate_pred(p):
+                    continue
+                dx = tok["cx"] - p["cx"]
+                dy = tok["cy"] - p["cy"]
+                scored.append((dx * dx + dy * dy, i))
+            scored.sort()
+            for _, i in scored[:k]:
+                claimed_polys.add(i)
+                label_indices.append(i)
+        print(f"[charbox] {name}: {len(qualifying)} tokens, "
+              f"{len(label_indices)} polygons claimed")
+        return label_indices
 
-    surface_layer = surface_polys
-    label_layer = [all_polys[i] for i in label_indices]
+    # Candidate predicates. Both exclude surfaces and stroke-only paths.
+    def _runway_candidate(p):
+        return p["filled"] and not p["is_taxi_surface"] and not p["is_runway_surface"]
+
+    def _taxi_candidate(p):
+        return (p["filled"] and p["is_near_black"]
+                and not p["is_taxi_surface"] and not p["is_runway_surface"])
+
+    runway_tokens = [t for t in text_tokens if RUNWAY_RE.match(t["text"])]
+    taxi_tokens = [t for t in text_tokens if TAXIWAY_RE.match(t["text"])]
+    print(f"[charbox] {len(runway_tokens)} runway-pattern tokens, "
+          f"{len(taxi_tokens)} taxi-pattern tokens")
+
+    claimed_polys: set[int] = set()
+    claimed_token_keys: set = set()
+
+    runway_label_idx = _run_match(
+        "runway labels (step 2)", runway_tokens, runway_surfaces,
+        _runway_candidate, claimed_polys, claimed_token_keys,
+    )
+    taxi_label_idx = _run_match(
+        "taxi labels", taxi_tokens, taxi_surfaces,
+        _taxi_candidate, claimed_polys, claimed_token_keys,
+    )
+
+    # --- 4) Step 3: extended runway centerline matching.
+    # For each runway surface, compute its principal axis and extend the
+    # centerline past both endpoints by RUNWAY_CENTERLINE_PAD_PT. Any
+    # filled, unclaimed, non-surface polygon whose bbox is intersected by
+    # this segment becomes a runway label.
+    centerlines = []
+    for s in runway_surfaces:
+        axis = _runway_axis_from_subpaths(s["subpaths"], s["rect"])
+        ext = axis["half_len"] + RUNWAY_CENTERLINE_PAD_PT
+        p1 = (axis["cx"] - axis["ux"] * ext, axis["cy"] - axis["uy"] * ext)
+        p2 = (axis["cx"] + axis["ux"] * ext, axis["cy"] + axis["uy"] * ext)
+        centerlines.append((p1, p2))
+
+    step3_idx: list[int] = []
+    for i, p in enumerate(all_polys):
+        if i in claimed_polys:
+            continue
+        if p["is_taxi_surface"] or p["is_runway_surface"]:
+            continue
+        if not p["filled"]:
+            continue
+        x0p, y0p, x1p, y1p = p["rect"]
+        for seg_p1, seg_p2 in centerlines:
+            if _segment_intersects_bbox(seg_p1, seg_p2, x0p, y0p, x1p, y1p):
+                claimed_polys.add(i)
+                step3_idx.append(i)
+                break
+    print(f"[charbox] runway labels (step 3 centerline): "
+          f"{len(step3_idx)} polygons claimed")
+
+    runway_label_idx = runway_label_idx + step3_idx
+    runway_label_layer = [all_polys[i] for i in runway_label_idx]
+    taxi_label_layer = [all_polys[i] for i in taxi_label_idx]
     polygons_layer = [
         p for i, p in enumerate(all_polys)
-        if i not in claimed and not p["is_surface"]
+        if i not in claimed_polys
+        and not p["is_taxi_surface"] and not p["is_runway_surface"]
     ]
-    print(f"[charbox] Taxiways: {len(surface_layer)}  "
+    print(f"[charbox] Layers — Taxiways: {len(taxi_surfaces)}  "
+          f"Runways: {len(runway_surfaces)}  "
           f"Polygons: {len(polygons_layer)}  "
-          f"Taxiway Labels: {len(label_layer)}")
+          f"Taxi Labels: {len(taxi_label_layer)}  "
+          f"Runway Labels: {len(runway_label_layer)}")
 
     # --- 4) Emit SVG
     svg_attrs = {
@@ -300,9 +487,11 @@ def main():
     })
 
     layers = [
-        ("Taxiways", surface_layer, None),
+        ("Taxiways", taxi_surfaces, None),
+        ("Runways", runway_surfaces, None),
         ("Polygons", polygons_layer, None),
-        ("Taxiway Labels", label_layer, LABEL_FILL),
+        ("Taxiway Labels", taxi_label_layer, TAXI_LABEL_FILL),
+        ("Runway Labels", runway_label_layer, RUNWAY_LABEL_FILL),
     ]
     for layer_name, paths, override_fill in layers:
         if not paths:
