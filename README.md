@@ -48,7 +48,7 @@ Labels) are claimed in steps 1–3 before ML runs.
 
 1. **Taxi surfaces (rule-based).** Filled polygons whose RGB is gray
    (~#cfcfcf with leeway: avg 175–235, channel spread ≤ 20). This is
-   the *only* source for Taxiways.
+   the primary source for Taxiways.
 
 2. **Runways (rule-based, NASR-driven).** Look up the airport in
    `data/nasr_apt_rwy.csv`, count its non-helipad runways → `N`. From
@@ -63,6 +63,32 @@ Labels) are claimed in steps 1–3 before ML runs.
    candidates; when a clip wins, the largest polygon fully contained
    in its scissor is claimed (this is how F45's grass strip — drawn
    only as a clipped hatch pattern — gets picked up).
+
+   **2b. Runway end pads (rule-based).** A second source for Taxiways.
+   FAA chart convention draws runway run-up / hold pads at the
+   threshold as **stroked-only rectangles** (not gray-filled), so step 1
+   misses them and step 7's stroked-only sweep would otherwise demote
+   them to Other. The current ML head (v25) emits only Footprints /
+   Stars / Other so it can't route them either. The rule is deliberately
+   tight — pads sit practically touching the runway when they exist:
+   - Candidate must be stroked AND not filled AND unclaimed.
+   - At least one anchor of the candidate polygon must project past one
+     of the runway's longitudinal ends on its principal axis AND lie
+     within the centerline band (`half_wid + 5pt`) laterally — this is
+     the "polygon sits on the extended centerline past the threshold"
+     test, computed from anchor projections so chart rotation is exact.
+   - Polygon-boundary-to-polygon-boundary minimum distance between the
+     candidate and the runway must be ≤ **5pt** (tolerance constant
+     `RUNWAY_END_PAD_MAX_DISTANCE_PT` in `taxi_detection.py`). Distances
+     are anchor-of-one-against-segments-of-the-other, so they don't
+     depend on bbox alignment — bbox-based math is wrong on rotated
+     runways.
+
+   Bbox tests are deliberately avoided in step 2b. FAA charts rotate
+   runways arbitrarily on the page; an axis-aligned bbox of a rotated
+   runway gives misleading "ends" and would falsely admit polygons
+   along the bbox edge. The principal-axis anchor projection is exact
+   for any rotation.
 
 3. **Runway + Taxiway Labels (rule-based).** Two passes, runway-first.
    *Runway Labels:* for each rule-claimed Runway, compute its principal
@@ -99,11 +125,12 @@ Labels) are claimed in steps 1–3 before ML runs.
    No mask/postprocessing on the probability matrix; argmax wins.
 
 6. **Stroked-only sweep (final).** Any polygon whose `stroked && !filled`
-   *and* isn't on the Runways layer is demoted to **Other**. This
-   catches Lights stripes, arrowheads, and decorative line-art that ML
-   classed as Other-or-Footprint. Runways are exempt because grass-
-   strip runways are drawn as stroked rectangles (F45 is the canonical
-   case).
+   *and* isn't on the Runways or Taxiways layer is demoted to **Other**.
+   This catches Lights stripes, arrowheads, and decorative line-art
+   that ML classed as Other-or-Footprint. Two exemptions: Runways
+   (grass-strip runways are drawn as stroked rectangles — F45 is the
+   canonical case) and Taxiways (runway-end run-up / hold pads claimed
+   in step 2b are also stroked-only and must survive this sweep).
 
 The PDF Text Tokens debug layer is always emitted: every word in the
 PDF text stream as a magenta 4pt text frame at its bbox center.
@@ -245,7 +272,8 @@ All six steps in the rebuilt pipeline are now landed:
 6. **Stroked → Other (final sweep).** Done — `classify_pipeline.py`
    step 7 demotes any polygon with `stroked && !filled` to Other,
    except those on the Runways layer (grass-strip runways are
-   stroked rectangles).
+   stroked rectangles) or the Taxiways layer (runway-end hold pads
+   claimed in step 2b are also stroked-only).
 
 ## Commit history (rebuild)
 

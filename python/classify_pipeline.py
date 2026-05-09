@@ -11,6 +11,17 @@ from the pool seen by every later step.
                           near-black or stroked candidates, after
                           taxi-surface removal). Replaces ML-based
                           runway prediction.
+  2b.  Runway end pads    rule-based. Stroked-unfilled polygons
+                          sitting flush (within 5pt) with a
+                          rule-claimed runway's longitudinal end are
+                          claimed as Taxiways. These are run-up / hold
+                          pads drawn by FAA chart convention as
+                          stroked-only rectangles, so the gray-fill
+                          rule (step 1) misses them and the final
+                          stroked-only sweep (step 7) would otherwise
+                          demote them to Other. Tolerance is
+                          deliberately tight: pads are practically
+                          touching the runway when they exist.
   3.   Runway Labels      For each rule-claimed Runway, extend a
                           thin centerline past each end. The closest
                           NASR-listed runway-name token whose
@@ -75,7 +86,7 @@ from hull_filter import hull_reject
 from load import LABELS, ML_LABELS, load_features_all
 from relational import add_relational_features, load_edges
 from runway_detection import detect_runways
-from taxi_detection import match_taxi_labels
+from taxi_detection import detect_runway_end_pads, match_taxi_labels
 
 
 RUNWAY_RE = re.compile(r"^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$")
@@ -378,6 +389,27 @@ def main():
     print(f"  runways: {len(rwy_set)}")
     claimed |= rwy_set
 
+    # ---- Step 2b: runway end-pad detection (rule-based) --------------
+    # FAA charts draw run-up / hold pads at runway thresholds as
+    # stroked-only rectangles (not filled gray), so step 1 misses them
+    # and step 7's stroked-only sweep would later demote them to Other.
+    # The pads sit practically touching the runway when they exist, so
+    # the tolerance is tight (5pt) — see
+    # taxi_detection.RUNWAY_END_PAD_MAX_DISTANCE_PT.
+    print(f"[pipeline] step 2b: runway end-pad detection (stroked, flush)")
+    end_pad_set = detect_runway_end_pads(
+        all_polys, runway_indices=rwy_set, claimed_polys=claimed,
+    )
+    print(f"  end pads: {len(end_pad_set)}")
+    # End pads ARE taxi surfaces, so fold them into surf_set /
+    # taxi_surfaces. Step 4 (taxi-label K-nearest claim) tests
+    # bbox-touches-taxi-surface; a taxi label letter painted on a hold
+    # pad pavement should match, so the pads must participate in that
+    # gate.
+    surf_set |= end_pad_set
+    taxi_surfaces = [all_polys[i] for i in sorted(surf_set)]
+    claimed |= end_pad_set
+
     # ---- Step 3: runway-label centerline-token search ----------------
     # Done BEFORE taxi-label matching so digit-glyph polygons that
     # belong to a runway designator are reserved first. This matters
@@ -420,7 +452,13 @@ def main():
         final_label[i] = "Taxiways"
         final_top[i] = "Taxiways"
         final_override[i] = True
-        final_source[i] = "rule_taxi_surface"
+        # Distinguish gray-fill surfaces from runway-end pads for
+        # diagnostics — both go on the Taxiways layer, but the source
+        # label tells you which rule made the claim.
+        final_source[i] = (
+            "rule_runway_end_pad" if i in end_pad_set
+            else "rule_taxi_surface"
+        )
 
     for i in label_set:
         final_label[i] = "Taxiway Labels"
@@ -541,14 +579,22 @@ def main():
 
     # ---- Step 7 (user-facing step 6): stroked-only sweep -------------
     # Final pass: any polygon that's stroked-only (stroked && not filled)
-    # AND not on the Runways layer is demoted to Other. Catches Lights,
-    # arrowheads, line art, decorative symbols that survive ML. Runways
-    # are exempt — grass-strip runways are drawn as stroked rectangles
-    # and must stay on the Runways layer (rule-claimed in step 2).
-    print(f"[pipeline] step 7: stroked-only sweep → Other (Runways exempt)")
+    # AND not on the Runways or Taxiways layer is demoted to Other.
+    # Catches Lights, arrowheads, line art, decorative symbols that
+    # survive ML. Two exemptions:
+    #   - Runways: grass-strip runways are drawn as stroked rectangles
+    #     (F45 is the canonical case) and must stay on the Runways
+    #     layer (rule-claimed in step 2).
+    #   - Taxiways: runway-end run-up / hold pads are drawn as stroked-
+    #     only rectangles too and are claimed in step 2b. Without this
+    #     exemption, step 7 would un-do step 2b's claim.
+    print(f"[pipeline] step 7: stroked-only sweep → Other "
+          f"(Runways and Taxiways exempt)")
     stroked_demoted = 0
     for i, p in enumerate(all_polys):
         if final_label[i] == "Runways":
+            continue
+        if final_label[i] == "Taxiways":
             continue
         if final_label[i] == "Other":
             continue  # already there
