@@ -2,20 +2,22 @@
 runway_label_layout.py — runway-label repositioning along the runway
 centerline.
 
-Runs after step 3 (runway-label matching) in classify_pipeline.py.
-For each (runway, end, label-polygon-group) triple step 3 identified,
-this module computes ONE translation vector per group so the label's
-nearest-glyph anchor lands exactly LABEL_CLEARANCE_PT points past the
-last contiguous pavement edge along the runway centerline.
+Runs after final classification in classify_pipeline.py. For every
+(runway, end, label-polygon-group) triple step 3 identified, this
+module computes ONE translation vector per group so the label sits
+centered on the runway centerline AND is shifted outward along that
+centerline far enough that no glyph polygon overlaps any visible
+polygon (taxiways, runways, footprints, taxiway labels, other runway
+labels).
 
 Why a separate module
 ---------------------
 classify_pipeline.py orchestrates classification (which polygon goes
 on which layer). Repositioning is a layout / presentation concern,
 not a classification concern, and bundling them muddies both. The
-geometry here (ray-vs-segment intersection, principal-axis projection,
-rigid translation along an arbitrarily-rotated centerline) also
-benefits from being self-contained and unit-testable.
+geometry here (polygon-polygon overlap, principal-axis projection,
+march-and-test) also benefits from being self-contained and unit-
+testable.
 
 Why not mutate polygon dicts in place
 -------------------------------------
@@ -27,53 +29,48 @@ the pipeline writes those translations into the predictions JSON;
 the renderer applies them as SVG `transform="translate(dx, dy)"`
 attributes per `<path>` element. Original geometry stays intact.
 
+Why march-and-test instead of "find the hold-pad polygon"
+---------------------------------------------------------
+The previous algorithm picked the FIRST gray-fill polygon along the
+extended centerline and aligned the label past that polygon's far
+edge. It was brittle in two ways: (a) when the centerline crosses a
+second runway past the runway end, the rule "FIRST gray-fill polygon"
+ignored the crossing runway and the label ended up sitting on it;
+(b) any classification gap (hold pad missing from gray fill, runway
+end blunt, fragmented pavement) silently produced a wrong placement.
+March-and-test is geometry-only: it asks "is the label glyph hitting
+anything visible?" and steps outward until the answer is no. It
+naturally handles crossing runways, fragmented pavement, missing
+hold pads, and any future class added to the collision set.
+
 Algorithm — per (runway, end, label_polygon_indices) triple
 -----------------------------------------------------------
   1. Principal axis of the runway via PCA: (cx, cy, ux, uy, half_len).
      Outward unit vector for this end is end_sign * (ux, uy).
      Runway-end point on this side: (cx, cy) + half_len * outward.
-  2. Cast a ray from the runway-end point along the outward unit.
-     For each filled-Taxi polygon, compute every ray-vs-boundary
-     intersection. Pick the polygon whose smallest intersection
-     ("near_t") is closest to the runway end (i.e. the FIRST polygon
-     the centerline encounters past the threshold). The polygon's
-     largest intersection ("far_t") is the centerline exit — where
-     the ray walks out of that polygon's pavement, and where the
-     label needs to clear by `label_clearance` points.
-       - Sanity gate: near_t must be ≤ CONTIGUITY_TOLERANCE_PT (1pt).
-         Any larger and the polygon doesn't actually start at the
-         threshold — there's a gap, and we don't want to align across
-         it.
-       - This finder takes only FILLED-Taxi indices as candidates
-         (step 1's gray-fill claims). Stroked-only artwork is
-         demoted to Other by step 7 and never enters the contiguous-
-         extension search.
-  3. If no polygon passes, t_exit = 0 and the label lands 2pt past the
-     runway end itself.
-  4. Lateral centering. The translation also has a perpendicular-to-
-     centerline component so the label group's lateral bounds midpoint
-     sits exactly on the extended centerline (lat = 0). This handles
-     the case where a label group was originally drawn slightly off-
-     axis from the runway — without this, the label would still be
-     pushed 2pt past the pavement but offset to one side. The midpoint
-     is computed from the actual anchor-point min/max lat (NOT bbox)
+  2. Lateral component. Center the label group's anchor-bounds
+     midpoint on the centerline (lat = 0). Handles labels drawn
+     slightly off-axis from the runway. Anchor-bounds (NOT bbox)
      so an asymmetric token like "9R" doesn't get pulled off-center
      by the wider R glyph.
-  4. Compute current label inner edge:
-       current_inner = min over all anchors of all label polygons of
-                       end_sign * ((px - cx) * ux + (py - cy) * uy)
-     This is the outward-projection of the label's nearest-to-runway
-     glyph anchor. Crucially NOT a bbox: an axis-aligned bbox of an
-     angled multi-glyph label has empty corners that would push the
-     visible glyph too far from the pavement.
-  5. Desired inner edge:
-       target_inner = half_len + t_exit + LABEL_CLEARANCE_PT
-  6. Single translation vector for the whole group:
-       delta = target_inner - current_inner
-       (dx, dy) = delta * outward_unit
-     Same vector applied to every polygon in the group, so the label
-     translates rigidly along the centerline. No rotation, no
-     glyph-relative deformation.
+  3. Longitudinal march.
+     Start with the label inner edge AT the runway end:
+       delta_long_start = half_len - current_inner
+     Then in MARCH_STEP_PT (0.5pt) increments outward, translate
+     every label polygon by (delta_long * out_unit + lat_delta) and
+     test polygon-polygon overlap of each translated glyph against
+     every collision polygon (taxiways, runways, footprints, taxi
+     labels, other runway labels — the group's own polys excluded).
+     The first step at which no glyph overlaps anything is the
+     resting position.
+  4. Add LABEL_CLEARANCE_PT (2.0pt) outward as a minimum-clearance
+     buffer. Net result: the label is between 2.0pt and
+     (2.0 + march_step) pt past the nearest pavement edge — matching
+     the visual spacing of the older hold-pad-based algorithm.
+  5. Final translation vector:
+       (dx, dy) = delta_long_final * out_unit + delta_lat * perp_unit
+     applied uniformly to every polygon in the label group — rigid
+     translation, no rotation, no glyph-relative deformation.
 
 Geometry coordinates
 --------------------
@@ -85,8 +82,8 @@ transforms with no flip.
 Public
 ------
   compute_runway_label_translations(
-    all_polys, step3_diag, taxi_indices,
-    contiguity_tolerance=1.0, label_clearance=2.0,
+    all_polys, step3_diag, collision_indices,
+    label_clearance=2.0, march_step=0.5, max_march_pt=200.0,
   ) -> (translations, diagnostics)
 """
 
@@ -97,8 +94,9 @@ import math
 from pipeline.taxi_detection import _point_in_subpaths, _runway_extents
 
 
-CONTIGUITY_TOLERANCE_PT = 1.0
 LABEL_CLEARANCE_PT = 2.0
+MARCH_STEP_PT = 0.5
+MAX_MARCH_PT = 200.0
 
 
 # ---------------------------------------------------------------------------
@@ -122,105 +120,107 @@ def _polygon_segments(subpaths):
             yield ring[i], ring[(i + 1) % n]
 
 
-def _ray_segment_intersection_t(rx: float, ry: float,
-                                ux: float, uy: float,
-                                ax: float, ay: float,
-                                bx: float, by: float) -> float | None:
-    """Return the parameter t >= 0 along the ray
-    P(t) = (rx, ry) + t * (ux, uy) at which the ray crosses the
-    segment a→b within the segment's bounds, else None.
+def _segments_intersect(p1, p2, q1, q2) -> bool:
+    """True iff segment p1-p2 crosses segment q1-q2.
 
-    Solve r + t*u = a + s*(b - a) for (t, s):
-        t*ux - s*sx = ax - rx
-        t*uy - s*sy = ay - ry
-    where (sx, sy) = (bx - ax, by - ay).
+    Standard CCW orientation test plus a collinear-overlap fallback.
+    Endpoint-on-segment counts as intersecting — for label clearance
+    "edge touching edge" is still overlap that the march should push
+    past.
     """
-    sx = bx - ax
-    sy = by - ay
-    denom = ux * (-sy) - uy * (-sx)
-    if abs(denom) < 1e-12:
-        return None
-    t = ((ax - rx) * (-sy) - (ay - ry) * (-sx)) / denom
-    s = (ux * (ay - ry) - uy * (ax - rx)) / denom
-    # Allow a tiny tolerance on s so a corner crossing isn't missed.
-    if t < 0.0 or s < -1e-9 or s > 1.0 + 1e-9:
-        return None
-    return t
+    def ccw(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    d1 = ccw(q1, q2, p1)
+    d2 = ccw(q1, q2, p2)
+    d3 = ccw(p1, p2, q1)
+    d4 = ccw(p1, p2, q2)
+    if (((d1 > 0) and (d2 < 0)) or ((d1 < 0) and (d2 > 0))) and \
+       (((d3 > 0) and (d4 < 0)) or ((d3 < 0) and (d4 > 0))):
+        return True
+
+    def on_segment(a, b, c):
+        return (min(a[0], b[0]) <= c[0] <= max(a[0], b[0]) and
+                min(a[1], b[1]) <= c[1] <= max(a[1], b[1]))
+
+    if d1 == 0 and on_segment(q1, q2, p1):
+        return True
+    if d2 == 0 and on_segment(q1, q2, p2):
+        return True
+    if d3 == 0 and on_segment(p1, p2, q1):
+        return True
+    if d4 == 0 and on_segment(p1, p2, q2):
+        return True
+    return False
+
+
+def _rects_overlap(a, b) -> bool:
+    """True iff axis-aligned rects (x0, y0, x1, y1) overlap (touching counts)."""
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+def _polygons_overlap(a_subpaths, b_subpaths) -> bool:
+    """True iff two compound polygons (subpaths) overlap.
+
+    Tests in order: any vertex of A inside B, any vertex of B inside
+    A, any edge of A crosses any edge of B. Together these catch
+    containment in either direction and partial intersection. Caller
+    should bbox-prefilter to avoid the O(N*M) edge crossings on
+    obviously-disjoint pairs.
+    """
+    for ring in a_subpaths or []:
+        for x, y in ring:
+            if _point_in_subpaths(x, y, b_subpaths):
+                return True
+    for ring in b_subpaths or []:
+        for x, y in ring:
+            if _point_in_subpaths(x, y, a_subpaths):
+                return True
+    for a, b in _polygon_segments(a_subpaths):
+        for c, d in _polygon_segments(b_subpaths):
+            if _segments_intersect(a, b, c, d):
+                return True
+    return False
+
+
+def _translate_subpaths(subpaths, dx: float, dy: float):
+    """Return a new subpaths list with every anchor shifted by (dx, dy)."""
+    return [[(x + dx, y + dy) for (x, y) in ring] for ring in subpaths or []]
+
+
+def _translate_rect(rect, dx: float, dy: float):
+    """Return (x0+dx, y0+dy, x1+dx, y1+dy)."""
+    return (rect[0] + dx, rect[1] + dy, rect[2] + dx, rect[3] + dy)
 
 
 # ---------------------------------------------------------------------------
-# First-extension-along-centerline search
+# Label-group collision check (translated)
 # ---------------------------------------------------------------------------
 
-def _first_extension_along_centerline(
-    candidate_polys_by_idx: dict[int, dict],
-    rwy_end_x: float, rwy_end_y: float,
-    out_ux: float, out_uy: float,
-    near_tolerance: float,
-) -> tuple[int, float, float] | None:
-    """Cast a ray outward from the runway-end point along
-    (out_ux, out_uy) and return the FIRST candidate polygon the ray
-    enters — the one whose entry intersection (smallest t > 0) is
-    closest to the runway end. Returns (idx, near_t, far_t) or None.
+def _label_group_collides(
+    label_polys: list[dict],
+    dx: float, dy: float,
+    collision_polys: list[dict],
+) -> bool:
+    """True iff any polygon in label_polys, after translation by
+    (dx, dy), overlaps any polygon in collision_polys.
 
-    Why "first along centerline" instead of "closest by polygon-
-    boundary distance":
-      - Two adjacent gray-fill Taxiways (a hold pad at the threshold
-        and the apron immediately behind it) can BOTH touch the runway
-        boundary, so a "min boundary distance" tiebreaker becomes
-        arbitrary iteration order. The user observed this as the
-        algorithm picking the LATER polygon and aligning the label
-        past its far end instead of the first polygon's far end.
-      - The label sits on the centerline. What matters for label
-        positioning is the FIRST polygon the centerline encounters
-        past the threshold, and that polygon's FAR edge (where the
-        label clears the pavement). Geometric ray-vs-boundary directly
-        captures that: a polygon's "near_t" is exactly its centerline
-        entry point.
-
-    near_tolerance: maximum allowed near_t. The polygon must START at
-        or near the runway end (gap ≤ near_tolerance), not be a
-        polygon 30pt past it across a gap.
+    Bbox-prefilters every candidate pair before the deep polygon test.
+    Builds the translated subpaths for each label glyph at most once
+    per call (lazily, only when at least one collision polygon's bbox
+    intersects).
     """
-    best_near_t = math.inf
-    best_far_t = 0.0
-    best_idx: int | None = None
-    for idx, poly in candidate_polys_by_idx.items():
-        sp = poly.get("subpaths") or []
-        if not sp:
-            continue
-        # If the runway-end point is INSIDE the polygon, near_t = 0 —
-        # the polygon already contains the threshold and the ray
-        # starts within it. This is the common case on FAA charts
-        # where the gray fill extends across the runway threshold,
-        # so a strict "ray must enter from outside" check would
-        # otherwise miss the actual contiguous extension.
-        point_inside = _point_in_subpaths(rwy_end_x, rwy_end_y, sp)
-        ts: list[float] = []
-        for (ax, ay), (bx, by) in _polygon_segments(sp):
-            t = _ray_segment_intersection_t(
-                rwy_end_x, rwy_end_y, out_ux, out_uy,
-                ax, ay, bx, by,
-            )
-            if t is not None and t > 0.0:
-                ts.append(t)
-        if point_inside:
-            near_t = 0.0
-            far_t = max(ts) if ts else 0.0
-        else:
-            if not ts:
+    for lp in label_polys:
+        l_rect = _translate_rect(lp["rect"], dx, dy)
+        translated = None  # built lazily on the first deep test
+        for cp in collision_polys:
+            if not _rects_overlap(l_rect, cp["rect"]):
                 continue
-            near_t = min(ts)
-            if near_t > near_tolerance:
-                continue
-            far_t = max(ts)
-        if near_t < best_near_t:
-            best_near_t = near_t
-            best_far_t = far_t
-            best_idx = idx
-    if best_idx is None:
-        return None
-    return best_idx, best_near_t, best_far_t
+            if translated is None:
+                translated = _translate_subpaths(lp["subpaths"], dx, dy)
+            if _polygons_overlap(translated, cp["subpaths"]):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +230,10 @@ def _first_extension_along_centerline(
 def compute_runway_label_translations(
     all_polys: list[dict],
     step3_diag: list[dict],
-    taxi_indices,
-    contiguity_tolerance: float = CONTIGUITY_TOLERANCE_PT,
+    collision_indices,
     label_clearance: float = LABEL_CLEARANCE_PT,
+    march_step: float = MARCH_STEP_PT,
+    max_march_pt: float = MAX_MARCH_PT,
 ) -> tuple[dict[int, tuple[float, float]], list[dict]]:
     """Compute translation vectors for every label group identified
     by step 3.
@@ -247,20 +248,32 @@ def compute_runway_label_translations(
             print-out from classify_pipeline.
 
     Inputs:
-      all_polys:     full polygon list from chart_scene.read_chart.
-      step3_diag:    diagnostics list emitted by classify_pipeline's
-                     `_match_runway_labels`. Only entries with
-                     `matched=True` and a non-empty `claimed` list
-                     drive a move.
-      taxi_indices:  iterable of FILLED-Taxi polygon indices from
-                     step 1 (gray-fill detection). Stroked-only
-                     polygons aren't on the Taxiways layer at all —
-                     step 7's stroked-only sweep demotes them to
-                     Other.
+      all_polys:           full polygon list from chart_scene.read_chart.
+      step3_diag:          diagnostics list emitted by classify_pipeline's
+                           `_match_runway_labels`. Only entries with
+                           `matched=True` and a non-empty `claimed` list
+                           drive a move.
+      collision_indices:   iterable of polygon indices to treat as
+                           visible obstacles. Caller picks classes —
+                           typically Taxiways, Runways, Footprints,
+                           Taxiway Labels, Runway Labels. Each label
+                           group's own polygons are removed from this
+                           set automatically before its march.
+      label_clearance:     extra outward distance added once the march
+                           finds a no-overlap step (default 2.0 pt —
+                           matches the spacing the older hold-pad-
+                           based algorithm produced).
+      march_step:          increment along the centerline per step
+                           (default 0.5 pt). Smaller = tighter stop,
+                           more checks.
+      max_march_pt:        safety cap on march distance (default 200
+                           pt). If the label hasn't cleared by this
+                           distance, it stops here and the diagnostic
+                           records `collision_at_rest=True`.
     """
     translations: dict[int, tuple[float, float]] = {}
     diagnostics: list[dict] = []
-    candidate_polys_by_idx = {i: all_polys[i] for i in taxi_indices}
+    collision_index_set = set(collision_indices)
 
     for diag in step3_diag:
         if not diag.get("matched"):
@@ -276,33 +289,20 @@ def compute_runway_label_translations(
         )
         out_ux = end_sign * ux
         out_uy = end_sign * uy
-        rwy_end_x = cx + half_len * out_ux
-        rwy_end_y = cy + half_len * out_uy
-
-        # Find the FIRST filled-Taxi polygon along the extended
-        # centerline past this end. Use that polygon's FAR edge for
-        # alignment — the label clears its visible pavement.
-        first = _first_extension_along_centerline(
-            candidate_polys_by_idx,
-            rwy_end_x, rwy_end_y, out_ux, out_uy,
-            near_tolerance=contiguity_tolerance,
-        )
-        if first is not None:
-            ext_idx, near_t, t_exit = first
-        else:
-            ext_idx = None
-            near_t = None
-            t_exit = 0.0
+        # Lateral basis: principal-axis perpendicular. Sign is
+        # independent of end_sign — perpendicular is symmetric.
+        perp_x = -uy
+        perp_y = ux
 
         # Scan every anchor of every polygon in the label group ONCE,
-        # collecting both:
+        # collecting:
         #   - current_inner: smallest outward-projection (glyph anchor
-        #     closest to the runway). Drives the longitudinal move.
+        #     closest to the runway). Drives the longitudinal start.
         #   - lat_min / lat_max: range of lateral positions across the
         #     whole group's anchors. Drives the lateral centering move.
         # Bbox is deliberately NOT used — an angled label has empty
         # bbox corners that misrepresent the actual visible glyph
-        # extent (see module docstring).
+        # extent.
         current_inner = math.inf
         lat_min = math.inf
         lat_max = -math.inf
@@ -312,7 +312,7 @@ def compute_runway_label_translations(
                 outward_pos = end_sign * long_pos_signed
                 if outward_pos < current_inner:
                     current_inner = outward_pos
-                lat = -(px - cx) * uy + (py - cy) * ux
+                lat = (px - cx) * perp_x + (py - cy) * perp_y
                 if lat < lat_min:
                     lat_min = lat
                 if lat > lat_max:
@@ -320,28 +320,53 @@ def compute_runway_label_translations(
         if not math.isfinite(current_inner) or not math.isfinite(lat_min):
             continue
 
-        # Longitudinal component: place the inner edge `label_clearance`
-        # past the centerline exit of the chosen extension (or past
-        # the runway end if no extension).
-        target_inner = half_len + t_exit + label_clearance
-        delta_long = target_inner - current_inner
-
-        # Lateral component: center the label group's anchor-bounds
-        # midpoint on the centerline (lat = 0). Using the midpoint of
-        # min/max lateral anchor positions matches "the actual bounds
-        # of the art" regardless of glyph asymmetry — for an
-        # asymmetric token like "9R" the wide R doesn't pull the
-        # lateral center off where it should be.
+        # Lateral component: center anchor-bounds midpoint on centerline.
         lat_center = (lat_min + lat_max) / 2.0
         delta_lat = -lat_center
 
-        # Combine into one (dx, dy). Longitudinal moves along the
-        # outward direction (out_ux, out_uy); lateral moves along the
-        # principal-axis perpendicular (-uy, ux). The lateral basis
-        # is independent of end_sign — perpendicular to the runway is
-        # the same regardless of which end you are facing.
-        dx = delta_long * out_ux + delta_lat * (-uy)
-        dy = delta_long * out_uy + delta_lat * ux
+        # Build collision polygon list for this group (exclude self).
+        own = set(claimed_indices)
+        collision_polys = [
+            all_polys[i] for i in collision_index_set
+            if i not in own
+        ]
+        label_polys = [all_polys[i] for i in claimed_indices]
+
+        # Longitudinal march. Canonical starting position is the
+        # label inner edge AT the runway end, regardless of where
+        # the chart artist drew it (we'll either pull it back to the
+        # threshold and march outward, or push it forward — whichever
+        # finds the first clear position).
+        delta_long_start = half_len - current_inner
+        n_steps = int(max_march_pt / march_step) + 1
+        cleared_offset_pt: float | None = None
+        for k in range(n_steps):
+            offset_pt = k * march_step
+            delta_long = delta_long_start + offset_pt
+            dx = delta_long * out_ux + delta_lat * perp_x
+            dy = delta_long * out_uy + delta_lat * perp_y
+            if not _label_group_collides(
+                label_polys, dx, dy, collision_polys,
+            ):
+                cleared_offset_pt = offset_pt
+                break
+
+        if cleared_offset_pt is None:
+            # Hit the cap. Park the label at max_march_pt past the
+            # runway end and flag for inspection. Sane charts should
+            # never reach this branch.
+            cleared_offset_pt = max_march_pt
+            collision_at_rest = True
+        else:
+            collision_at_rest = False
+
+        # Add the minimum-clearance buffer so the label is at least
+        # `label_clearance` pt past the nearest pavement edge.
+        delta_long_final = (
+            delta_long_start + cleared_offset_pt + label_clearance
+        )
+        dx = delta_long_final * out_ux + delta_lat * perp_x
+        dy = delta_long_final * out_uy + delta_lat * perp_y
 
         for li in claimed_indices:
             translations[li] = (dx, dy)
@@ -350,12 +375,11 @@ def compute_runway_label_translations(
             "runway_idx": ri,
             "end_sign": end_sign,
             "token": diag.get("token"),
-            "extension_idx": ext_idx,
-            "near_t": near_t,
-            "t_exit": t_exit,
             "current_inner": current_inner,
-            "target_inner": target_inner,
-            "delta_along_centerline": delta_long,
+            "delta_long_start": delta_long_start,
+            "march_offset_pt": cleared_offset_pt,
+            "delta_long_final": delta_long_final,
+            "collision_at_rest": collision_at_rest,
             "lat_center": lat_center,
             "delta_lat": delta_lat,
             "dx": dx,

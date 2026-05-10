@@ -22,18 +22,6 @@ from the pool seen by every later step.
                           chart-only token like APF "6" is rejected,
                           and compass-direction names ("NE/SW")
                           qualify for turf strips.
-  3b.  Runway-label move  Layout-only step (no classification change).
-                          For each runway-label group claimed in step
-                          3, finds the FIRST gray-fill Taxi polygon
-                          along the extended centerline past this end
-                          (near_t ≤ 1pt, or the runway-end point sits
-                          inside the polygon), then computes one rigid
-                          translation vector that places the label
-                          group's nearest glyph anchor 2pt past that
-                          polygon's far edge AND centers the group
-                          laterally on the centerline. Without this,
-                          runway labels often render on top of a
-                          taxiway. See pipeline/runway_label_layout.py.
   4.   Taxi Labels        Token regex K-nearest gated on bbox-
                           touches-taxi-surface, restricted to the
                           unclaimed pool. Runs AFTER runway-label
@@ -73,11 +61,27 @@ from the pool seen by every later step.
                           Runways are the only exemption because
                           grass-strip runways are drawn as stroked
                           rectangles (F45 is the canonical case).
+  8.   Runway-label move  Layout-only step (no classification change).
+                          For each runway-label group claimed in step
+                          3, lateral-centers the group on the runway
+                          centerline and marches it outward in 0.5pt
+                          increments past the runway end until no
+                          glyph polygon overlaps any visible polygon
+                          (Taxiways, Runways, Footprints, Taxiway
+                          Labels, Runway Labels — own group excluded),
+                          then adds a 2.0pt minimum-clearance buffer.
+                          Runs LAST because the collision set requires
+                          every polygon's final classification (ML
+                          Footprints, rule-claimed Taxiway Labels,
+                          stroked-sweep demotions). One rigid (dx, dy)
+                          per group goes into the predictions JSON;
+                          render_svg_layers applies it as an SVG
+                          transform. See pipeline/runway_label_layout.py.
 
 Output: predictions JSON consumed by render_svg_layers.py — one
 record per polygon with label, bbox (AI y-up coordinates), and a
 per-polygon (translate_x, translate_y) in PyMuPDF top-left coords for
-step 3b's runway-label move.
+step 8's runway-label move.
 
 Usage:
     python classify_pipeline.py \\
@@ -429,29 +433,6 @@ def main():
           f"polygons reassigned: {len(rwy_label_idx)}")
     claimed |= rwy_label_idx
 
-    # ---- Step 3b: runway-label move along the centerline ------------
-    # Layout-only — does NOT change any polygon's class. For every
-    # label group claimed in step 3, computes one rigid translation
-    # vector that places the group's nearest-glyph anchor 2pt past
-    # the FIRST gray-fill Taxi polygon along the extended centerline
-    # AND centers the group laterally on the centerline. Output is a
-    # per-polygon (dx, dy) carried into the predictions JSON as
-    # translate_x / translate_y; render_svg_layers applies it as an
-    # SVG transform. See pipeline/runway_label_layout.py for the full
-    # algorithm + rationale.
-    print(f"[pipeline] step 3b: runway-label move along centerline")
-    label_translations, step3b_diag = compute_runway_label_translations(
-        all_polys, step3_diag, taxi_indices=surf_set,
-    )
-    args.out.with_suffix(".step3b.json").write_text(
-        json.dumps(step3b_diag, indent=2, default=str)
-    )
-    n_moved = sum(
-        1 for tx, ty in label_translations.values()
-        if abs(tx) > 1e-6 or abs(ty) > 1e-6
-    )
-    print(f"  label polygons translated: {n_moved}")
-
     # ---- Step 4: taxi-label K-nearest claim --------------------------
     # Tokens consumed by step 3 are excluded — each PDF text token
     # identifies polygons at most once across the pipeline.
@@ -618,10 +599,53 @@ def main():
             stroked_demoted += 1
     print(f"  stroked-only polygons demoted: {stroked_demoted}")
 
+    # ---- Step 8: runway-label move along the centerline -------------
+    # Layout-only — does NOT change any polygon's class. For every
+    # label group claimed in step 3, computes one rigid translation
+    # vector that (a) centers the group laterally on the runway
+    # centerline and (b) marches the group outward along the
+    # centerline until no glyph polygon overlaps any visible polygon
+    # (Taxiways, Runways, Footprints, Taxiway Labels, Runway Labels),
+    # plus a 2.0pt minimum-clearance buffer. Output is a per-polygon
+    # (dx, dy) carried into the predictions JSON as translate_x /
+    # translate_y; render_svg_layers applies it as an SVG transform.
+    # See pipeline/runway_label_layout.py for the full algorithm.
+    #
+    # Runs LAST in the classification flow because the collision set
+    # depends on the final label of every polygon — Footprints come
+    # from ML (step 6), Taxiway Labels from rule (step 4), and the
+    # stroked-only sweep (step 7) demotes lights and decorative
+    # artwork to Other. Earlier in the pipeline the collision set
+    # would be incomplete and the march would stop short.
+    print(f"[pipeline] step 8: runway-label move along centerline")
+    collision_classes = {
+        "Taxiways", "Runways", "Footprints",
+        "Taxiway Labels", "Runway Labels",
+    }
+    collision_indices = {
+        i for i in range(len(all_polys))
+        if final_label[i] in collision_classes
+    }
+    label_translations, step3b_diag = compute_runway_label_translations(
+        all_polys, step3_diag, collision_indices=collision_indices,
+    )
+    args.out.with_suffix(".step3b.json").write_text(
+        json.dumps(step3b_diag, indent=2, default=str)
+    )
+    n_moved = sum(
+        1 for tx, ty in label_translations.values()
+        if abs(tx) > 1e-6 or abs(ty) > 1e-6
+    )
+    n_capped = sum(
+        1 for d in step3b_diag if d.get("collision_at_rest")
+    )
+    print(f"  label polygons translated: {n_moved}"
+          + (f", hit max-march cap: {n_capped}" if n_capped else ""))
+
     # ---- Build records JSON ------------------------------------------
-    # translate_x / translate_y carry step-3b's per-polygon centerline
+    # translate_x / translate_y carry step 8's per-polygon centerline
     # move (PyMuPDF top-left coords, points). Default 0/0 for every
-    # polygon that step 3b didn't touch. render_svg_layers applies
+    # polygon that step 8 didn't touch. render_svg_layers applies
     # these as `transform="translate(...)"` per <path> element.
     records = []
     for i in range(len(all_polys)):

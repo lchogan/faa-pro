@@ -68,7 +68,7 @@ panel.
         ▼
 <airport>_paths.csv             4331 polygons w/ geometric features
         │
-        │  Step 2   classify_pipeline.py — the brain (6 substeps)
+        │  Step 2   classify_pipeline.py — the brain (8 substeps)
         ▼
 <airport>_predictions.json      one record per polygon, AI y-up bbox
         │
@@ -98,7 +98,7 @@ run. It:
    reference data, not part of the editable diagram.
 6. Saves the `.ai` and leaves it open for review.
 
-### `classify_pipeline.py` — the 7 substeps
+### `classify_pipeline.py` — the 8 substeps
 
 Polygons claimed in earlier substeps are **removed from the pool** seen
 by every later substep. ML only decides Footprints / Stars / Other; the
@@ -134,41 +134,6 @@ Labels) are all claimed in steps 1–4 before ML runs.
    another runway end. Runs **before** taxi labels (step 4) so a digit
    glyph belonging to a runway designator (e.g. APF "5" sitting over a
    taxiway) is reserved before taxi-label matching can grab it.
-
-   **3b. Runway-label move along the centerline (layout).** Layout-
-   only step — does NOT change which layer any polygon is on.
-   Implemented in [`python/pipeline/runway_label_layout.py`](python/pipeline/runway_label_layout.py).
-   For every label group claimed in step 3, picks the **first
-   filled-Taxi polygon along the extended centerline past this end**
-   and aligns the label `2pt` past that polygon's far edge. The
-   translation has TWO components combined into one rigid `(dx, dy)`
-   applied to every polygon in the group:
-
-   - **Longitudinal**: cast a ray from the runway-end point along the
-     outward principal axis. The first filled-Taxi polygon the ray
-     enters is the contiguous extension — its smallest ray-vs-boundary
-     intersection is `near_t`, its largest is `far_t`. The label's
-     nearest-glyph anchor (computed from actual polygon anchors, NOT
-     bbox — an angled "22L" has empty bbox corners that would push the
-     visible glyph too far) is shifted to land at
-     `half_len + far_t + 2pt` along the outward axis. If the runway
-     end happens to sit INSIDE the polygon (gray fill extending across
-     the threshold, common on FAA charts), `near_t` is treated as 0.
-     Sanity gate: `near_t ≤ 1pt` so a polygon 30pt past the threshold
-     across a gap doesn't get picked.
-
-   - **Lateral**: also center the group on the centerline. The
-     label's anchor-bounds midpoint perpendicular to the runway axis
-     is computed from actual polygon anchors
-     (`(lat_min + lat_max) / 2`), and the group is shifted so that
-     midpoint sits at `lat = 0`. Without this, labels drawn slightly
-     off-axis (left or right of the centerline in the source PDF)
-     would still be off-axis after the longitudinal move.
-
-   The translation per polygon is carried through the predictions
-   JSON as `translate_x` / `translate_y` and applied as an SVG
-   `transform="translate(...)"` per `<path>` in stage 3 (renderer) —
-   original PDF geometry stays intact.
 
 4. **Taxi Labels (rule-based).** PDF text tokens matching
    `^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$` whose centroid sits inside a
@@ -207,6 +172,50 @@ Labels) are all claimed in steps 1–4 before ML runs.
    exemption because grass-strip runways are drawn as stroked
    rectangles (F45 is the canonical case).
 
+8. **Runway-label move along the centerline (layout).** Layout-only
+   — does NOT change which layer any polygon is on. Implemented in
+   [`python/pipeline/runway_label_layout.py`](python/pipeline/runway_label_layout.py).
+   Runs LAST because the collision set requires every polygon's final
+   classification (ML-derived Footprints, rule-claimed Taxi Labels,
+   stroked-sweep demotions). The translation has TWO components
+   combined into one rigid `(dx, dy)` applied to every polygon in the
+   group:
+
+   - **Lateral**: center the group on the centerline. The label's
+     anchor-bounds midpoint perpendicular to the runway axis is
+     computed from actual polygon anchors (`(lat_min + lat_max) / 2`,
+     NOT bbox — an asymmetric "9R" has the wider R glyph that would
+     pull a bbox center off the centerline), and the group is shifted
+     so that midpoint sits at `lat = 0`.
+
+   - **Longitudinal (march-and-test)**: start with the label's inner
+     edge AT the runway end (`half_len - current_inner`), then march
+     outward along the centerline in 0.5pt increments. At each step,
+     translate every glyph polygon by the trial `(dx, dy)` and test
+     polygon-polygon overlap (point-in-polygon both ways + edge
+     crossings, with a bbox prefilter) against every visible polygon
+     — Taxiways, Runways, Footprints, Taxi Labels, other Runway
+     Labels — minus the group's own polys. The first step at which
+     no glyph overlaps anything is the resting position; add 2.0pt
+     as a minimum-clearance buffer (matches the visual spacing of
+     the older hold-pad-based algorithm). Net clearance from the
+     nearest pavement edge is in `[2.0, 2.5]`pt.
+
+   This replaced an earlier rule that picked the first gray-fill
+   polygon along the extended centerline and aligned past its far
+   edge. The first-polygon rule was brittle when a crossing runway
+   sat past the runway end (the centerline crossed it but the
+   geometry-only "first gray fill" check ignored it, so the label
+   landed on the crossing pavement) and when pavement was fragmented
+   or the hold pad was missing from the gray-fill set. The
+   march-and-test approach is geometry-only and naturally handles all
+   of those cases — the label moves until visibly clear.
+
+   The translation per polygon is carried through the predictions
+   JSON as `translate_x` / `translate_y` and applied as an SVG
+   `transform="translate(...)"` per `<path>` in stage 3 (renderer) —
+   original PDF geometry stays intact.
+
 The PDF Text Tokens debug layer is always emitted: every word in the
 PDF text stream as a magenta 4pt text frame at its bbox center.
 Useful for spot-checking why a token did or didn't qualify.
@@ -220,7 +229,7 @@ faa-pro/
 ├── classify-wrapper.conf                # default folder paths for the wrapper
 ├── README.md                            # this file
 ├── python/
-│   ├── classify_pipeline.py             # 7-substep orchestrator (Stage 2)
+│   ├── classify_pipeline.py             # 8-substep orchestrator (Stage 2)
 │   ├── render_svg_layers.py             # SVG export (Stage 3)
 │   ├── pipeline/                        # rule-based detection modules
 │   │   ├── chart_scene.py               #   PDF → polygons + clips + tokens
@@ -229,7 +238,7 @@ faa-pro/
 │   │   ├── extract_pdf_text.py          #   NASR + text extraction
 │   │   ├── hull_filter.py               #   concave-hull rejection (substep 5)
 │   │   ├── runway_detection.py          #   rule-based runway (substep 2)
-│   │   ├── runway_label_layout.py       #   centerline label move (substep 3b)
+│   │   ├── runway_label_layout.py       #   centerline label move (substep 8)
 │   │   └── taxi_detection.py            #   gray-fill + taxi-label K-nearest
 │   ├── ml/                              # ML training + utilities
 │   │   ├── load.py                      #   CSV schema + LABELS constants
