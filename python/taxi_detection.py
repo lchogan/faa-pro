@@ -209,6 +209,22 @@ def _runway_extents(subpaths: list[list[tuple[float, float]]],
 # or annotation rectangles that happen to live near a runway end.
 RUNWAY_END_PAD_MAX_DISTANCE_PT = 5.0
 
+# Minimum extent in the candidate's own minor (PCA) direction for it
+# to qualify as a hold pad. Measured in the candidate's intrinsic
+# frame, NOT bbox or runway frame:
+#   - bbox is wrong on diagonal lines (a 2.88pt line at 35° gives
+#     a square-ish bbox with both dims ≈1.6pt)
+#   - runway-frame projection is wrong for the same reason — projecting
+#     a non-aligned line onto an arbitrary axis gives non-zero in both
+#     directions
+#   - PCA minor extent ≈ 0 for any set of collinear anchors, regardless
+#     of orientation, which is exactly the property we want.
+# A real hold pad has meaningful 2-D extent (its narrow dimension is
+# at least a few points). A stroked centerline mark, threshold stripe,
+# or approach-line indicator collapses to ~0 perpendicular to its
+# long axis.
+MIN_PAD_DIMENSION_PT = 3.0
+
 
 def _point_to_segment_distance(px: float, py: float,
                                ax: float, ay: float,
@@ -315,7 +331,15 @@ def detect_runway_end_pads(all_polys: list[dict],
          "polygon sits on the extended centerline past the threshold"
          test, computed from anchor projections so chart rotation is
          handled exactly.
-      3. Polygon-boundary-to-polygon-boundary minimum distance between
+      3. Candidate has meaningful 2-D extent in its OWN PCA frame:
+         minor-axis extent ≥ MIN_PAD_DIMENSION_PT. Rejects 1-D
+         strokes near the threshold (centerline-extension marks,
+         threshold stripes, approach-line indicators) that pass
+         gates 1, 2, and 4 but aren't pads. PCA minor extent is
+         used because runway-frame projection of an off-axis line
+         gives non-zero on both axes — the only frame in which a
+         line collapses to 0 is its own intrinsic frame.
+      4. Polygon-boundary-to-polygon-boundary minimum distance between
          the candidate and the runway is ≤ max_distance. This is the
          "practically touching" test — measured anchor-of-one against
          segments-of-the-other (exact for non-intersecting polygons in
@@ -357,22 +381,39 @@ def detect_runway_end_pads(all_polys: list[dict],
             cand_subpaths = p.get("subpaths") or []
             if not cand_subpaths:
                 continue
-            # Step 2: any anchor on the extended centerline past an end?
+            # Gate 2: any anchor on the extended centerline past
+            # an end? Also collect anchors for the PCA gate below.
             on_centerline_past_end = False
+            anchors: list[tuple[float, float]] = []
             for ring in cand_subpaths:
                 for ax_, ay_ in ring:
+                    anchors.append((ax_, ay_))
                     dxv = ax_ - cx
                     dyv = ay_ - cy
                     long_pos = dxv * ux + dyv * uy
                     lat = -dxv * uy + dyv * ux
-                    if abs(long_pos) > half_len and abs(lat) <= lat_band:
+                    if (abs(long_pos) > half_len
+                            and abs(lat) <= lat_band):
                         on_centerline_past_end = True
-                        break
-                if on_centerline_past_end:
-                    break
             if not on_centerline_past_end:
                 continue
-            # Step 3: polygon boundaries practically touching.
+            # Gate 3: PCA minor-axis extent. A real hold pad has
+            # meaningful 2-D extent in its own intrinsic frame; a
+            # 1-D stroke (collinear anchors at any orientation)
+            # collapses to ~0 along its minor axis. Need ≥ 3
+            # anchors for a meaningful PCA — fewer than that is by
+            # definition either degenerate (1 pt) or a single line
+            # segment (2 pts), both rejected.
+            if len(anchors) < 3:
+                continue
+            arr = np.asarray(anchors, dtype=float)
+            centered = arr - arr.mean(axis=0)
+            _, _, vt = np.linalg.svd(centered, full_matrices=False)
+            minor_proj = centered @ vt[1]
+            minor_extent = float(minor_proj.max() - minor_proj.min())
+            if minor_extent < MIN_PAD_DIMENSION_PT:
+                continue
+            # Gate 4: polygon boundaries practically touching.
             d = _min_polygon_boundary_distance(rwy_subpaths, cand_subpaths)
             if d > max_distance:
                 continue
