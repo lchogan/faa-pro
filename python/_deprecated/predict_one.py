@@ -25,10 +25,10 @@ from pathlib import Path
 import lightgbm as lgb
 import pandas as pd
 
-from extract_pdf_text import _normalize_designation, find_known_runway_designations, load_nasr_runways
-from load import load_features_all, LABELS
-from predict import apply_overrides, MAYBE_OF
-from relational import add_relational_features, load_edges, load_pdf_text
+from _deprecated.predict import apply_overrides, MAYBE_OF
+from ml.load import load_features_all, LABELS
+from ml.relational import add_relational_features, load_edges, load_pdf_text
+from pipeline.extract_pdf_text import _normalize_designation, find_known_runway_designations, load_nasr_runways
 
 
 def extract_pdf_text_for_one(pdf_path: Path, nasr_csv: Path, out_csv: Path) -> int:

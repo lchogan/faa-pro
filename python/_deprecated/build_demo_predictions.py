@@ -21,8 +21,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from load import LABELS
-from predict import apply_overrides, MAYBE_OF
+from ml.load import LABELS
+from _deprecated.predict import apply_overrides, MAYBE_OF
 
 
 def main():

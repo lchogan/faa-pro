@@ -40,7 +40,7 @@ if str(_HERE) not in sys.path:
 
 import pandas as pd
 
-from extract_paths_fitz import CSV_COLUMNS, EDGE_COLUMNS, extract_paths
+from pipeline.extract_paths_fitz import CSV_COLUMNS, EDGE_COLUMNS, extract_paths
 
 
 def _walk_diagrams(root: Path) -> list[tuple[str, Path]]:

@@ -1,7 +1,10 @@
 """
-render_char_layers_charbox.py — render PDF polygons + word-level text
-tokens to SVG, with rule-based taxiway-surface and taxiway-label
-detection.
+render_char_layers_charbox.py — DEPRECATED. Experimental SVG variant
+not in the production path (production uses render_svg_layers.py).
+Kept for reference only.
+
+render PDF polygons + word-level text tokens to SVG, with rule-based
+taxiway-surface and taxiway-label detection.
 
 Output layers:
   1. Taxiways         — gray-filled polygons (~#cfcfcf, the pavement
@@ -41,7 +44,7 @@ from pathlib import Path
 
 import fitz
 
-from extract_paths_fitz import _color_to_rgb, items_to_subpaths
+from pipeline.extract_paths_fitz import _color_to_rgb, items_to_subpaths
 
 
 TAXIWAY_RE = re.compile(r"^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$")

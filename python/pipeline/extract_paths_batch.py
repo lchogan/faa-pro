@@ -25,12 +25,14 @@ import sys
 import time
 from pathlib import Path
 
-# Make our extractor importable when the script runs from any CWD.
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+# Make sibling modules importable when the script runs from any CWD.
+# python/ root needs to be on sys.path so `from pipeline.* import ...`
+# and `from ml.* import ...` resolve.
+_PYTHON_ROOT = Path(__file__).resolve().parents[1]
+if str(_PYTHON_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_ROOT))
 
-from extract_paths_fitz import extract_paths, CSV_COLUMNS, EDGE_COLUMNS, write_csvs
+from pipeline.extract_paths_fitz import extract_paths, CSV_COLUMNS, EDGE_COLUMNS, write_csvs
 
 
 DEFAULT_ROOTS = [

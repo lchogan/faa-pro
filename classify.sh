@@ -17,7 +17,7 @@
 #
 # Requires:
 #   - Python venv at faa-pro/.venv with deps installed
-#   - Trained model at faa-pro/python/runs/v25/model.lgb
+#   - Trained model at faa-pro/python/ml/runs/v25/model.lgb
 #
 # Pipeline defaults (v1, locked 2026-05-07):
 #   --skip-hull           — concave-hull rejection is OFF in production.
@@ -37,6 +37,14 @@ set -euo pipefail
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$PROJECT/.venv/bin/python3"
+
+# Make `from pipeline.* import …` and `from ml.* import …` resolve from
+# any script under python/. Required because the pipeline/, ml/, and
+# _deprecated/ subpackages aren't installed — they're sibling
+# directories under python/, and Python only auto-adds the *script's*
+# directory to sys.path. Setting PYTHONPATH here makes python/ the
+# resolution root for every invocation in this file.
+export PYTHONPATH="$PROJECT/python${PYTHONPATH:+:$PYTHONPATH}"
 
 # Extra args appended to classify_pipeline.py — set by env to override.
 # Default disables hull rejection (see header comment for rationale).
@@ -114,7 +122,7 @@ process_one() {
     # Step 1 — PyMuPDF: extract path CSV (no Illustrator)
     # ------------------------------------------------------------------
     echo "   [1/4] PyMuPDF: extract paths..."
-    "$PYTHON" "$PROJECT/python/extract_paths_fitz.py" \
+    "$PYTHON" "$PROJECT/python/pipeline/extract_paths_fitz.py" \
         --pdf "$pdf" --airport "$airport" --out-dir "$folder" >/dev/null
 
     if [[ ! -f "$paths_csv" ]]; then
@@ -126,13 +134,18 @@ process_one() {
     echo "   ✓ extracted $path_count paths"
 
     # ------------------------------------------------------------------
-    # Step 2 — classify_pipeline.py runs the full 6-step pipeline in
-    #          order: taxi surfaces (1), runways (2), runway+taxi
-    #          labels (3), hull rejection [SKIPPED in v1] (4), ML on
-    #          remaining unclaimed (5), stroked-only sweep (6). ML
-    #          never sees polygons claimed in steps 1-3.
+    # Step 2 — classify_pipeline.py runs the full pipeline in order:
+    #          1   taxi surfaces (gray fill)
+    #          2   runways (NASR-driven)
+    #          3   runway labels (centerline-token search)
+    #          3b  runway-label move along centerline (layout)
+    #          4   taxi labels (K-nearest)
+    #          5   hull rejection (SKIPPED in production via --skip-hull)
+    #          6   ML on remaining unclaimed
+    #          7   stroked-only sweep → Other
+    #          ML never sees polygons claimed in steps 1-4.
     # ------------------------------------------------------------------
-    echo "   [2/4] Pipeline: 6-step classification..."
+    echo "   [2/4] Pipeline: classification..."
     "$PYTHON" "$PROJECT/python/classify_pipeline.py" \
         --paths "$paths_csv" \
         --pdf "$pdf" \

@@ -47,8 +47,8 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 
-from load import load_features_all, LABELS
-from relational import add_relational_features, load_pdf_text
+from ml.load import load_features_all, LABELS
+from ml.relational import add_relational_features, load_pdf_text
 
 # Class → its "Maybe" sibling. Other has no Maybe (Other is already the
 # catch-all uncertain class).

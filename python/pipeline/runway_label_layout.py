@@ -44,10 +44,10 @@ Algorithm — per (runway, end, label_polygon_indices) triple
          Any larger and the polygon doesn't actually start at the
          threshold — there's a gap, and we don't want to align across
          it.
-       - This finder takes only FILLED-Taxi indices as candidates, NOT
-         the stroked outlines from step 2b. Outlines duplicate fill
-         geometry; including them would make "first polygon along
-         centerline" ambiguous between the fill and its outline twin.
+       - This finder takes only FILLED-Taxi indices as candidates
+         (step 1's gray-fill claims). Stroked-only artwork is
+         demoted to Other by step 7 and never enters the contiguous-
+         extension search.
   3. If no polygon passes, t_exit = 0 and the label lands 2pt past the
      runway end itself.
   4. Lateral centering. The translation also has a perpendicular-to-
@@ -94,7 +94,7 @@ from __future__ import annotations
 
 import math
 
-from taxi_detection import _point_in_subpaths, _runway_extents
+from pipeline.taxi_detection import _point_in_subpaths, _runway_extents
 
 
 CONTIGUITY_TOLERANCE_PT = 1.0
@@ -252,11 +252,11 @@ def compute_runway_label_translations(
                      `_match_runway_labels`. Only entries with
                      `matched=True` and a non-empty `claimed` list
                      drive a move.
-      taxi_indices:  iterable of FILLED-Taxi polygon indices (step 1
-                     gray fills only). Stroked outlines from step 2b
-                     should NOT be included — they duplicate the fill
-                     geometry and would create ambiguous "first along
-                     centerline" matches.
+      taxi_indices:  iterable of FILLED-Taxi polygon indices from
+                     step 1 (gray-fill detection). Stroked-only
+                     polygons aren't on the Taxiways layer at all —
+                     step 7's stroked-only sweep demotes them to
+                     Other.
     """
     translations: dict[int, tuple[float, float]] = {}
     diagnostics: list[dict] = []

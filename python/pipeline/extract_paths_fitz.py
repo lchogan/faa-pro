@@ -4,7 +4,7 @@ ClassifyAirport.jsx CSV format.
 
 Designed as a drop-in replacement for the Illustrator path-export step. The
 output schema is identical to what the JSX exporter writes, so build_char_training,
-load.py, and the v24 model retraining can all consume it without changes.
+load.py, and v25-style model retraining can all consume it without changes.
 
 Key parity points with the JSX implementation:
   - All coordinates are y-flipped to Illustrator (y-up) frame: y_ai = page_h - y_pdf
@@ -45,7 +45,7 @@ import numpy as np
 from scipy.spatial import ConvexHull
 from scipy.spatial import QhullError
 
-from load import UNLABELED, layer_name_to_label
+from ml.load import UNLABELED, layer_name_to_label
 
 
 CSV_COLUMNS = [

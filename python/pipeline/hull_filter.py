@@ -1,5 +1,9 @@
 """
-hull_filter.py — concave-hull rejection (step 4 of the six-step plan).
+hull_filter.py — concave-hull rejection (step 5 of classify_pipeline).
+
+Production runs with --skip-hull (set in classify.sh) so this step is
+a no-op in the production path. The code is kept for experimentation
+and may be re-enabled by clearing PIPELINE_EXTRA.
 
 Build a concave hull over the union of rule-claimed Runway and Taxiway
 polygons' anchor points. A candidate polygon is kept if its bounding

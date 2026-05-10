@@ -36,7 +36,7 @@ import lightgbm as lgb
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 
-from load import ML_LABELS, RULE_CLAIMED_LABELS, UNLABELED  # noqa: F401
+from ml.load import ML_LABELS, RULE_CLAIMED_LABELS, UNLABELED  # noqa: F401
 
 # Columns that are inputs to the model. Exclude ids, label, raw layer name,
 # and absolute coordinates (we have normalized + relative versions instead).

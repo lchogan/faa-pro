@@ -1,8 +1,14 @@
 """
-pdf_char_override.py — final-label assignment that replaces the brittle
-PDF-text-bbox-overlap rule and the entire 36-class char-classifier detour.
+pdf_char_override.py — DEPRECATED. Not used by classify_pipeline.
 
-Pipeline (for one airport):
+This module belonged to the predict.py / predict_one.py inference path,
+which has been replaced by classify_pipeline.py. The current pipeline
+handles runway labels, taxi labels, and stroked-only sweeping
+declaratively in steps 3, 4, and 7 — there's no separate
+"final-label assignment" pass any more. Kept for archaeology only.
+
+Original purpose was to replace the brittle PDF-text-bbox-overlap rule
+and the 36-class char-classifier detour:
 
   1. Pre-classify Taxiways by color. Filled-gray polygons (RGB in
      150-235 with low channel spread) are taxiway pavement, full stop.
@@ -43,9 +49,9 @@ import fitz
 import numpy as np
 import pandas as pd
 
-from extract_pdf_text import _normalize_designation
-from extract_paths_fitz import items_to_subpaths
-from load import LABELS
+from ml.load import LABELS
+from pipeline.extract_paths_fitz import items_to_subpaths
+from pipeline.extract_pdf_text import _normalize_designation
 
 _RUNWAY_RE = re.compile(r"^\d{1,2}[LRC]?$")
 # Taxiway designations: typically 1-2 chars (A, B1) but big hub airports

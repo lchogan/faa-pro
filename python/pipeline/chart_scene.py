@@ -28,7 +28,7 @@ from pathlib import Path
 
 import fitz
 
-from extract_paths_fitz import (
+from pipeline.extract_paths_fitz import (
     _Bounds,
     _color_to_rgb,
     _is_off_artboard,

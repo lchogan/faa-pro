@@ -24,16 +24,16 @@ from the pool seen by every later step.
                           qualify for turf strips.
   3b.  Runway-label move  Layout-only step (no classification change).
                           For each runway-label group claimed in step
-                          3, find the contiguous pavement extension at
-                          that end (gray-fill or end-pad, within 1pt
-                          of the runway boundary, with at least one
-                          anchor past this end on the centerline) and
-                          compute one translation vector that places
-                          the label group's nearest glyph anchor 2pt
-                          past the centerline exit of that extension.
-                          Without this, runway labels often render on
-                          top of the run-up pad. See
-                          runway_label_layout.py.
+                          3, finds the FIRST gray-fill Taxi polygon
+                          along the extended centerline past this end
+                          (near_t ≤ 1pt, or the runway-end point sits
+                          inside the polygon), then computes one rigid
+                          translation vector that places the label
+                          group's nearest glyph anchor 2pt past that
+                          polygon's far edge AND centers the group
+                          laterally on the centerline. Without this,
+                          runway labels often render on top of a
+                          taxiway. See pipeline/runway_label_layout.py.
   4.   Taxi Labels        Token regex K-nearest gated on bbox-
                           touches-taxi-surface, restricted to the
                           unclaimed pool. Runs AFTER runway-label
@@ -74,9 +74,10 @@ from the pool seen by every later step.
                           grass-strip runways are drawn as stroked
                           rectangles (F45 is the canonical case).
 
-Output: predictions JSON in the same format as predict_one.py — one
-record per polygon, with bbox in AI y-up coordinates so
-ImportPredictedLayers.jsx can match each Illustrator path.
+Output: predictions JSON consumed by render_svg_layers.py — one
+record per polygon with label, bbox (AI y-up coordinates), and a
+per-polygon (translate_x, translate_y) in PyMuPDF top-left coords for
+step 3b's runway-label move.
 
 Usage:
     python classify_pipeline.py \\
@@ -96,17 +97,17 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from chart_scene import read_chart
-from extract_pdf_text import (
+from ml.load import LABELS, ML_LABELS, load_features_all
+from ml.relational import add_relational_features, load_edges
+from pipeline.chart_scene import read_chart
+from pipeline.extract_pdf_text import (
     _normalize_designation,
     load_nasr_runways,
 )
-from hull_filter import hull_reject
-from load import LABELS, ML_LABELS, load_features_all
-from relational import add_relational_features, load_edges
-from runway_detection import detect_runways
-from runway_label_layout import compute_runway_label_translations
-from taxi_detection import match_taxi_labels
+from pipeline.hull_filter import hull_reject
+from pipeline.runway_detection import detect_runways
+from pipeline.runway_label_layout import compute_runway_label_translations
+from pipeline.taxi_detection import match_taxi_labels
 
 
 RUNWAY_RE = re.compile(r"^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$")
@@ -362,9 +363,9 @@ def main():
                     help="Source <airport>-faa.pdf")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--model", type=Path,
-                    default=Path(__file__).parent / "runs" / "v25" / "model.lgb")
+                    default=Path(__file__).parent / "ml" / "runs" / "v25" / "model.lgb")
     ap.add_argument("--feature-list", type=Path,
-                    default=Path(__file__).parent / "runs" / "v25" / "feature_list.json")
+                    default=Path(__file__).parent / "ml" / "runs" / "v25" / "feature_list.json")
     ap.add_argument("--nasr-rwy", type=Path,
                     default=Path(__file__).parent.parent / "data" / "nasr_apt_rwy.csv")
     ap.add_argument("--skip-hull", action="store_true",
@@ -430,13 +431,14 @@ def main():
 
     # ---- Step 3b: runway-label move along the centerline ------------
     # Layout-only — does NOT change any polygon's class. For every
-    # label group claimed in step 3, computes one translation vector
-    # along the runway centerline so the group's nearest-glyph anchor
-    # lands 2pt past the contiguous pavement extension (gray-fill
-    # taxiway or end-pad) at that runway end. Output is a per-polygon
-    # (dx, dy) carried into the predictions JSON as translate_x /
-    # translate_y; render_svg_layers applies it as an SVG transform.
-    # See runway_label_layout.py for the full algorithm + rationale.
+    # label group claimed in step 3, computes one rigid translation
+    # vector that places the group's nearest-glyph anchor 2pt past
+    # the FIRST gray-fill Taxi polygon along the extended centerline
+    # AND centers the group laterally on the centerline. Output is a
+    # per-polygon (dx, dy) carried into the predictions JSON as
+    # translate_x / translate_y; render_svg_layers applies it as an
+    # SVG transform. See pipeline/runway_label_layout.py for the full
+    # algorithm + rationale.
     print(f"[pipeline] step 3b: runway-label move along centerline")
     label_translations, step3b_diag = compute_runway_label_translations(
         all_polys, step3_diag, taxi_indices=surf_set,
@@ -616,7 +618,7 @@ def main():
             stroked_demoted += 1
     print(f"  stroked-only polygons demoted: {stroked_demoted}")
 
-    # ---- Build records JSON in predict_one.py format -----------------
+    # ---- Build records JSON ------------------------------------------
     # translate_x / translate_y carry step-3b's per-polygon centerline
     # move (PyMuPDF top-left coords, points). Default 0/0 for every
     # polygon that step 3b didn't touch. render_svg_layers applies
@@ -643,8 +645,8 @@ def main():
 
     # Debug: PDF Text Tokens. Each word from the PDF text stream with
     # its bbox center in AI y-up coords. Consumed by
-    # ImportPredictedLayers.jsx to build a "PDF Text Tokens" layer in
-    # the final AI file.
+    # render_svg_layers.py to build a "PDF Text Tokens" layer in the
+    # final SVG.
     token_records = [{
         "text": t["text"],
         "x":    round(t["cx"], 4),

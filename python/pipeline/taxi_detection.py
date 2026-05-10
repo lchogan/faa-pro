@@ -21,7 +21,7 @@ runway-label matching, so digit-glyph polygons that belong to a
 runway designator are already claimed and unavailable to the
 taxi-label K-nearest. This avoids the failure mode where APF runway
 "5" sits over a taxiway and gets claimed as a taxi label, leaving
-the digit-5 polygon unavailable when step 5 looks for runway labels.
+the digit-5 polygon unavailable when step 3 looks for runway labels.
 
 Coordinates are PDF y-down (matching PyMuPDF). Convert to AI y-up at
 the consumer boundary if needed.
@@ -48,7 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
-from chart_scene import read_chart
+from pipeline.chart_scene import read_chart
 
 
 TAXIWAY_RE = re.compile(r"^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$")
@@ -152,10 +152,8 @@ def _runway_extents(subpaths: list[list[tuple[float, float]]],
     along and across the axis.
 
     Mirrors classify_pipeline._runway_axis but additionally returns the
-    lateral half-extent. End-pad detection needs the lateral half-width
-    so it can reject stroked polygons that sit alongside the runway
-    (those are not run-up pads — they're either curb stripes or chart
-    annotation).
+    lateral half-extent. Used by runway_label_layout for the lateral
+    centering computation in step 3b.
 
     Returns (cx, cy, ux, uy, half_len, half_wid) where:
       (cx, cy)   — projection-midpoint center (symmetric per-end)

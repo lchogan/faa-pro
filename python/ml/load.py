@@ -27,7 +27,7 @@ LABELS = (
 )
 # ML classes — the 3-class subset the v25 LightGBM is trained to predict.
 # Everything outside this set is rule-claimed earlier in the pipeline (steps
-# 1-4) or swept by the stroked-only step 6.
+# 1-4) or swept by the stroked-only step 7.
 ML_LABELS = (
     "Footprints",
     "Stars",
@@ -115,7 +115,7 @@ LAYER_TO_LABEL = {
     "taxiways": "Taxiways", "taxiway": "Taxiways",
     "footprints": "Footprints", "footprint": "Footprints",
     "runways": "Runways", "runway": "Runways",
-    # Lights aren't a model class anymore (step 6 sweeps stroked items to
+    # Lights aren't a model class anymore (step 7 sweeps stroked items to
     # Other); folded into Other so legacy "Lights" layer rows still serve
     # as negatives during training.
     "lights": "Other", "light": "Other",

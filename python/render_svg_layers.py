@@ -24,7 +24,7 @@ from pathlib import Path
 
 import fitz
 
-from extract_paths_fitz import (
+from pipeline.extract_paths_fitz import (
     _Bounds,
     _is_off_artboard,
     items_to_subpaths,

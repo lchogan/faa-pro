@@ -58,7 +58,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
-from load import load_features_all
+from ml.load import load_features_all
 
 # Patterns used to classify PDF-extracted word text. Runway designations like
 # "9", "27L", "9R" vs taxiway designations like "A", "B1", "K2", "AA".
