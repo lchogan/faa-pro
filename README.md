@@ -107,7 +107,8 @@ Labels) are claimed in steps 1–3 before ML runs.
 
 1. **Taxi surfaces (rule-based).** Filled polygons whose RGB is gray
    (~#cfcfcf with leeway: avg 175–235, channel spread ≤ 20). This is
-   the primary source for Taxiways.
+   the *only* source for Taxiways — every stroked-unfilled polygon is
+   demoted to Other by the final stroked-only sweep.
 
 2. **Runways (rule-based, NASR-driven).** Look up the airport in
    `data/nasr_apt_rwy.csv`, count its non-helipad runways → `N`. From
@@ -123,24 +124,6 @@ Labels) are claimed in steps 1–3 before ML runs.
    in its scissor is claimed (this is how F45's grass strip — drawn
    only as a clipped hatch pattern — gets picked up).
 
-   **2b. Paired stroked outlines (rule-based).** A second source for
-   Taxiways. FAA charts draw each gray taxiway as TWO stacked
-   polygons — a filled gray polygon AND a separate stroked-unfilled
-   outline drawn on top. Step 1 catches the filled polygon; this step
-   claims the matching outline so the rendered Taxiways layer carries
-   both fill and border. Detection test: the stroked-unfilled
-   polygon's centroid sits inside one of the filled-Taxi polygons.
-   Centroid-in-fill is robust because:
-   - A polygon's outline shares its filled twin's centroid exactly.
-   - Arbitrary stroked artwork near pavement (centerline marks,
-     threshold stripes, arrowheads, line-art annotations) does NOT
-     have its centroid sitting inside a gray-fill region — those
-     artifacts live at the boundary or outside.
-   - A 1-D line segment's centroid is on the line, which is not
-     inside any 2-D fill region unless the line genuinely overlaps
-     pavement, in which case it is visually part of the taxiway.
-   Implemented in [`python/taxi_detection.py`](python/taxi_detection.py)
-   as `detect_paired_stroked_outlines`.
 
 3. **Runway + Taxiway Labels (rule-based).** Two passes, runway-first.
    *Runway Labels:* for each rule-claimed Runway, compute its principal
@@ -186,11 +169,6 @@ Labels) are claimed in steps 1–3 before ML runs.
      the centerline in the source PDF) would still be off-axis after
      the longitudinal move.
 
-   The contiguous-extension finder considers ONLY filled-Taxi polygons
-   (step 1 fills, NOT the step 2b stroked outlines) — outlines
-   duplicate fill geometry and would create ambiguous "first along
-   centerline" matches.
-
    The translation per polygon is carried through the predictions JSON
    as `translate_x` / `translate_y` and applied as an SVG
    `transform="translate(...)"` per `<path>` in step 3 (renderer) —
@@ -217,12 +195,12 @@ Labels) are claimed in steps 1–3 before ML runs.
    No mask/postprocessing on the probability matrix; argmax wins.
 
 6. **Stroked-only sweep (final).** Any polygon whose `stroked && !filled`
-   *and* isn't on the Runways or Taxiways layer is demoted to **Other**.
-   This catches Lights stripes, arrowheads, and decorative line-art
-   that ML classed as Other-or-Footprint. Two exemptions: Runways
-   (grass-strip runways are drawn as stroked rectangles — F45 is the
-   canonical case) and Taxiways (runway-end run-up / hold pads claimed
-   in step 2b are also stroked-only and must survive this sweep).
+   *and* isn't on the Runways layer is demoted to **Other**. This is
+   the absolute gate — every stroked-unfilled artifact (Lights stripes,
+   arrowheads, decorative line-art, taxiway outline polygons drawn
+   over the gray fill, painted hold-position bars, centerline marks)
+   ends up on Other. Runways are the only exemption because grass-strip
+   runways are drawn as stroked rectangles (F45 is the canonical case).
 
 The PDF Text Tokens debug layer is always emitted: every word in the
 PDF text stream as a magenta 4pt text frame at its bbox center.
@@ -364,8 +342,7 @@ All six steps in the rebuilt pipeline are now landed:
 6. **Stroked → Other (final sweep).** Done — `classify_pipeline.py`
    step 7 demotes any polygon with `stroked && !filled` to Other,
    except those on the Runways layer (grass-strip runways are
-   stroked rectangles) or the Taxiways layer (runway-end hold pads
-   claimed in step 2b are also stroked-only).
+   stroked rectangles).
 
 ## Commit history (rebuild)
 

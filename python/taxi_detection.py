@@ -5,20 +5,12 @@ This is the authoritative source for Taxiways and Taxiway Labels in the
 new pipeline. The ML model is *not* used for these two classes.
 
 Detection logic:
-  - Taxiway surface (gray fill): filled polygon with gray fill
-    (~#cfcfcf, with leeway for chart variation). Detection of the gray
-    fill itself happens in chart_scene.read_chart and is exposed via
-    the `is_taxi_surface` flag on each polygon dict.
-  - Taxiway surface (paired stroked outline): a stroked-unfilled polygon
-    whose centroid lies inside one of the gray-fill Taxiways. FAA charts
-    draw each gray taxi surface (including hold pads) as a filled gray
-    polygon AND a separate stroked outline polygon stacked on top.
-    Step 1 catches the gray fill; without this rule the matching outline
-    would be demoted to Other by the final stroked-only sweep, breaking
-    the visual when the Taxiways layer is rendered. Centroid-in-filled-
-    taxi uniquely identifies the outline relationship — arbitrary lines
-    or markings near pavement do not have their centroid inside a
-    gray-fill polygon. See `detect_paired_stroked_outlines`.
+  - Taxiway surface: filled polygon with gray fill (~#cfcfcf, with
+    leeway for chart variation). Detection of the gray fill itself
+    happens in chart_scene.read_chart and is exposed via the
+    `is_taxi_surface` flag on each polygon dict. This is the ONLY
+    source for the Taxiways layer — all stroked-unfilled polygons are
+    demoted to Other by step 7's stroked-only sweep.
   - Taxiway label: a word token matching `^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$`
     (e.g. "C", "C1", "A11", "3") whose bbox touches a taxi surface
     polygon. The K = len(token) nearest unclaimed near-black filled
@@ -43,24 +35,14 @@ Public:
         Run only the K-nearest claim, given an externally-loaded
         scene and a set of polygon indices already claimed by other
         steps. Production pipeline calls this directly.
-    detect_paired_stroked_outlines(all_polys, taxi_surface_indices,
-                                   claimed_polys=None) -> set[int]
-        Find stroked-unfilled polygons whose centroid sits inside any
-        already-claimed gray-fill Taxiway. These are the outline-on-fill
-        companion polygons that FAA charts draw over each taxi surface.
     _runway_extents(subpaths, fallback_rect) -> 6-tuple
         (cx, cy, ux, uy, half_len, half_wid) — runway principal-axis
         center, unit direction, and half-extents in long/lat. Re-used
         by runway_label_layout.py.
-    _min_polygon_boundary_distance(sp_a, sp_b) -> float
-        Approximate min boundary-to-boundary distance between two
-        compound polygons. Used by runway_label_layout.py for the
-        contiguous-extension touching test.
 """
 
 from __future__ import annotations
 
-import math
 import re
 from pathlib import Path
 
@@ -212,147 +194,6 @@ def _runway_extents(subpaths: list[list[tuple[float, float]]],
     return (cx, cy, ux, uy, half_len, half_wid)
 
 
-
-
-def _point_to_segment_distance(px: float, py: float,
-                               ax: float, ay: float,
-                               bx: float, by: float) -> float:
-    """Min distance from point (px, py) to the line segment a→b.
-    Standard projection-with-clamp; degenerate (a == b) collapses to
-    point-to-point distance.
-    """
-    abx = bx - ax
-    aby = by - ay
-    denom = abx * abx + aby * aby
-    if denom < 1e-12:
-        return math.hypot(px - ax, py - ay)
-    t = ((px - ax) * abx + (py - ay) * aby) / denom
-    if t < 0.0:
-        t = 0.0
-    elif t > 1.0:
-        t = 1.0
-    qx = ax + t * abx
-    qy = ay + t * aby
-    return math.hypot(px - qx, py - qy)
-
-
-def _min_polygon_boundary_distance(
-    sp_a: list[list[tuple[float, float]]],
-    sp_b: list[list[tuple[float, float]]],
-) -> float:
-    """Approximate min boundary-to-boundary distance between two
-    compound polygons defined by their subpath rings.
-
-    For each anchor in A, measure the minimum distance to any segment
-    of B; then symmetrically. The smaller of the two is the boundary
-    distance — this is exact when the polygons don't intersect (the
-    closest pair is always anchor-of-one to segment-of-other in 2D),
-    and returns 0 (or near-zero) when they touch or overlap.
-
-    Subpath anchors are taken from `subpaths` directly. Bbox is
-    deliberately NOT used — runways are arbitrarily rotated on FAA
-    charts and a bbox-based projection would introduce large errors.
-    """
-    def _segments(sp):
-        for ring in sp or []:
-            n = len(ring)
-            if n < 2:
-                continue
-            for i in range(n):
-                yield ring[i], ring[(i + 1) % n]
-
-    def _anchors(sp):
-        for ring in sp or []:
-            for pt in ring:
-                yield pt
-
-    min_d = math.inf
-    segs_b = list(_segments(sp_b))
-    if segs_b:
-        for px, py in _anchors(sp_a):
-            for (ax, ay), (bx, by) in segs_b:
-                d = _point_to_segment_distance(px, py, ax, ay, bx, by)
-                if d < min_d:
-                    min_d = d
-                    if min_d == 0.0:
-                        return 0.0
-    segs_a = list(_segments(sp_a))
-    if segs_a:
-        for px, py in _anchors(sp_b):
-            for (ax, ay), (bx, by) in segs_a:
-                d = _point_to_segment_distance(px, py, ax, ay, bx, by)
-                if d < min_d:
-                    min_d = d
-                    if min_d == 0.0:
-                        return 0.0
-    return min_d
-
-
-def detect_paired_stroked_outlines(
-    all_polys: list[dict],
-    taxi_surface_indices,
-    claimed_polys: set[int] | None = None,
-) -> set[int]:
-    """Find stroked-unfilled polygons that are visual outlines of an
-    already-claimed gray-fill taxi surface — i.e. their centroid lies
-    inside one of the filled-Taxi polygons.
-
-    Why this rule exists
-    --------------------
-    FAA airport diagrams draw each gray taxiway (apron, run-up area,
-    hold pad, taxi segment) as TWO stacked polygons:
-      1. A filled gray polygon — the pavement fill (caught by step 1).
-      2. A separate stroked-unfilled polygon over it — the pavement
-         outline.
-    Both are part of the visible taxiway. Without this rule the
-    outline polygon falls through to step 7's stroked-only sweep and
-    ends up on Other, leaving the rendered Taxiways layer with the
-    fill but no outline.
-
-    The detection test
-    ------------------
-    A stroked-unfilled polygon's centroid is inside one of the filled-
-    Taxi polygons. Centroid-in-fill is a robust proxy for the
-    fill/outline pairing because:
-      - A polygon's stroked outline shares its filled twin's centroid
-        exactly (same shape, same anchor extent).
-      - Arbitrary stroked artwork near pavement (centerline marks,
-        threshold stripes, arrowheads, line-art annotations) does NOT
-        have its centroid sitting inside a gray-fill region — those
-        live at the boundary or outside.
-      - 1-D line segments fail the test naturally: a line's centroid
-        is on the line itself, which is not inside any 2-D fill region
-        unless the line genuinely overlaps the pavement, in which case
-        it IS visually part of the taxiway and belongs on Taxiways
-        anyway.
-
-    Args:
-        all_polys: full polygon list from chart_scene.read_chart.
-        taxi_surface_indices: indices already claimed as Taxiways by
-            step 1 (gray-fill detection).
-        claimed_polys: indices already claimed by any step; skipped.
-
-    Returns:
-        set of polygon indices to add to the Taxiways layer.
-    """
-    claimed = set(claimed_polys or [])
-    surfaces = [all_polys[i] for i in taxi_surface_indices]
-    outline_indices: set[int] = set()
-    for i, p in enumerate(all_polys):
-        if i in claimed:
-            continue
-        if not p.get("stroked") or p.get("filled"):
-            continue
-        cx, cy = p["cx"], p["cy"]
-        for s in surfaces:
-            sx0, sy0, sx1, sy1 = s["rect"]
-            # Cheap bbox prefilter before the ray-cast.
-            if not (sx0 <= cx <= sx1 and sy0 <= cy <= sy1):
-                continue
-            if _point_in_subpaths(cx, cy, s.get("subpaths") or []):
-                outline_indices.add(i)
-                break
-    return outline_indices
 
 
 def detect_taxi(pdf_path: Path) -> dict:
