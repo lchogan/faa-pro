@@ -33,6 +33,18 @@ from the pool seen by every later step.
                           chart-only token like APF "6" is rejected,
                           and compass-direction names ("NE/SW")
                           qualify for turf strips.
+  3b.  Runway-label move  Layout-only step (no classification change).
+                          For each runway-label group claimed in step
+                          3, find the contiguous pavement extension at
+                          that end (gray-fill or end-pad, within 1pt
+                          of the runway boundary, with at least one
+                          anchor past this end on the centerline) and
+                          compute one translation vector that places
+                          the label group's nearest glyph anchor 2pt
+                          past the centerline exit of that extension.
+                          Without this, runway labels often render on
+                          top of the run-up pad. See
+                          runway_label_layout.py.
   4.   Taxi Labels        Token regex K-nearest gated on bbox-
                           touches-taxi-surface, restricted to the
                           unclaimed pool. Runs AFTER runway-label
@@ -86,6 +98,7 @@ from hull_filter import hull_reject
 from load import LABELS, ML_LABELS, load_features_all
 from relational import add_relational_features, load_edges
 from runway_detection import detect_runways
+from runway_label_layout import compute_runway_label_translations
 from taxi_detection import detect_runway_end_pads, match_taxi_labels
 
 
@@ -428,6 +441,28 @@ def main():
           f"polygons reassigned: {len(rwy_label_idx)}")
     claimed |= rwy_label_idx
 
+    # ---- Step 3b: runway-label move along the centerline ------------
+    # Layout-only — does NOT change any polygon's class. For every
+    # label group claimed in step 3, computes one translation vector
+    # along the runway centerline so the group's nearest-glyph anchor
+    # lands 2pt past the contiguous pavement extension (gray-fill
+    # taxiway or end-pad) at that runway end. Output is a per-polygon
+    # (dx, dy) carried into the predictions JSON as translate_x /
+    # translate_y; render_svg_layers applies it as an SVG transform.
+    # See runway_label_layout.py for the full algorithm + rationale.
+    print(f"[pipeline] step 3b: runway-label move along centerline")
+    label_translations, step3b_diag = compute_runway_label_translations(
+        all_polys, step3_diag, taxi_indices=surf_set,
+    )
+    args.out.with_suffix(".step3b.json").write_text(
+        json.dumps(step3b_diag, indent=2, default=str)
+    )
+    n_moved = sum(
+        1 for tx, ty in label_translations.values()
+        if abs(tx) > 1e-6 or abs(ty) > 1e-6
+    )
+    print(f"  label polygons translated: {n_moved}")
+
     # ---- Step 4: taxi-label K-nearest claim --------------------------
     # Tokens consumed by step 3 are excluded — each PDF text token
     # identifies polygons at most once across the pipeline.
@@ -608,8 +643,13 @@ def main():
     print(f"  stroked-only polygons demoted: {stroked_demoted}")
 
     # ---- Build records JSON in predict_one.py format -----------------
+    # translate_x / translate_y carry step-3b's per-polygon centerline
+    # move (PyMuPDF top-left coords, points). Default 0/0 for every
+    # polygon that step 3b didn't touch. render_svg_layers applies
+    # these as `transform="translate(...)"` per <path> element.
     records = []
     for i in range(len(all_polys)):
+        tx, ty = label_translations.get(i, (0.0, 0.0))
         records.append({
             "airport": str(df.iloc[i]["airport"]),
             "object_id": int(df.iloc[i]["object_id"]),
@@ -623,6 +663,8 @@ def main():
             "top":    round(float(df.iloc[i]["top"]),    4),
             "right":  round(float(df.iloc[i]["right"]),  4),
             "bottom": round(float(df.iloc[i]["bottom"]), 4),
+            "translate_x": round(float(tx), 4),
+            "translate_y": round(float(ty), 4),
         })
 
     # Debug: PDF Text Tokens. Each word from the PDF text stream with

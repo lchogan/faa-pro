@@ -104,6 +104,27 @@ Labels) are claimed in steps 1–3 before ML runs.
    (e.g. APF "5" sitting over a taxiway) is reserved before taxi-label
    matching can grab it.
 
+   **3b. Runway-label move along the centerline (layout).** Layout-
+   only step — does NOT change which layer any polygon is on.
+   Implemented in [`python/runway_label_layout.py`](python/runway_label_layout.py).
+   For every label group claimed in step 3, finds the contiguous
+   pavement extension at that runway end (a Taxiway whose boundary is
+   within **1pt** of the runway boundary AND has at least one anchor
+   past this end on the centerline AND the outward centerline ray
+   actually crosses its boundary — this last gate rejects aprons
+   adjacent to the runway *side* that aren't true centerline
+   extensions). Casts the ray from the runway-end point along the
+   principal axis; the largest ray-vs-boundary `t` is the centerline
+   exit. The label group's nearest-glyph anchor (computed from actual
+   polygon anchors, NOT bbox — an angled "22L" has empty bbox corners
+   that would push the visible glyph too far) is repositioned to land
+   `2pt` past the centerline exit by a single rigid translation
+   applied to every polygon in the group. If no extension is found,
+   the label lands `2pt` past the runway end itself. The translation
+   per polygon is carried through the predictions JSON as
+   `translate_x` / `translate_y` and applied as an SVG `transform="translate(…)"`
+   in step 3 (renderer) — original PDF geometry stays intact.
+
 4. **Concave-hull rejection (pre-ML).** Build a concave hull
    (`shapely.concave_hull(ratio=0.0)`, no buffer) over the rule-claimed
    Runways + Taxi surfaces' anchor points. An unclaimed polygon is

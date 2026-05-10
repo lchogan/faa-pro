@@ -161,6 +161,10 @@ def main():
         )
 
     # Bucket polygons by target layer.
+    # translate_x / translate_y come from classify_pipeline step 3b
+    # (runway-label move along centerline). Coordinates are in
+    # PyMuPDF top-left frame, same as the path data, so they apply
+    # directly as an SVG transform with no flip.
     layer_buckets: dict[str, list[dict]] = {name: [] for name in TARGET_LAYERS}
     for i, d in enumerate(valid_drawings):
         rec = preds[i]
@@ -170,11 +174,14 @@ def main():
         dtype = d.get("type", "")
         is_filled = "f" in dtype
         is_stroked = "s" in dtype
+        tx = float(rec.get("translate_x", 0.0) or 0.0)
+        ty = float(rec.get("translate_y", 0.0) or 0.0)
         layer_buckets[label].append({
             "d": _items_to_svg_d(d.get("items")),
             "fill": _color_hex(d.get("fill")) if is_filled else None,
             "stroke": _color_hex(d.get("color")) if is_stroked else None,
             "stroke_width": float(d.get("width") or 0.0) if is_stroked else 0.0,
+            "translate": (tx, ty),
         })
 
     # Build SVG. Inkscape namespace markers tell Illustrator's SVG
@@ -206,6 +213,9 @@ def main():
             if p["stroke"]:
                 attrs["stroke"] = p["stroke"]
                 attrs["stroke-width"] = f"{p['stroke_width']:.3f}"
+            tx, ty = p.get("translate", (0.0, 0.0))
+            if abs(tx) > 1e-6 or abs(ty) > 1e-6:
+                attrs["transform"] = f"translate({tx:.4f},{ty:.4f})"
             ET.SubElement(g, "path", attrs)
 
     # Add the PDF Text Tokens layer last so it ends up topmost.
