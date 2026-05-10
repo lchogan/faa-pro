@@ -11,17 +11,16 @@ from the pool seen by every later step.
                           near-black or stroked candidates, after
                           taxi-surface removal). Replaces ML-based
                           runway prediction.
-  2b.  Runway end pads    rule-based. Stroked-unfilled polygons
-                          sitting flush (within 5pt) with a
-                          rule-claimed runway's longitudinal end are
-                          claimed as Taxiways. These are run-up / hold
-                          pads drawn by FAA chart convention as
-                          stroked-only rectangles, so the gray-fill
-                          rule (step 1) misses them and the final
-                          stroked-only sweep (step 7) would otherwise
-                          demote them to Other. Tolerance is
-                          deliberately tight: pads are practically
-                          touching the runway when they exist.
+  2b.  Paired outlines    rule-based. FAA charts draw each gray
+                          taxiway as a filled gray polygon AND a
+                          separate stroked outline polygon stacked on
+                          top. Step 1 catches the fill; this step
+                          claims the matching stroked outline by
+                          finding stroked-unfilled polygons whose
+                          centroid sits inside one of the filled-Taxi
+                          polygons. Without this, step 7 would demote
+                          the outline to Other and the Taxiways layer
+                          would render with no boundary.
   3.   Runway Labels      For each rule-claimed Runway, extend a
                           thin centerline past each end. The closest
                           NASR-listed runway-name token whose
@@ -99,7 +98,7 @@ from load import LABELS, ML_LABELS, load_features_all
 from relational import add_relational_features, load_edges
 from runway_detection import detect_runways
 from runway_label_layout import compute_runway_label_translations
-from taxi_detection import detect_runway_end_pads, match_taxi_labels
+from taxi_detection import detect_paired_stroked_outlines, match_taxi_labels
 
 
 RUNWAY_RE = re.compile(r"^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$")
@@ -402,26 +401,30 @@ def main():
     print(f"  runways: {len(rwy_set)}")
     claimed |= rwy_set
 
-    # ---- Step 2b: runway end-pad detection (rule-based) --------------
-    # FAA charts draw run-up / hold pads at runway thresholds as
-    # stroked-only rectangles (not filled gray), so step 1 misses them
-    # and step 7's stroked-only sweep would later demote them to Other.
-    # The pads sit practically touching the runway when they exist, so
-    # the tolerance is tight (5pt) — see
-    # taxi_detection.RUNWAY_END_PAD_MAX_DISTANCE_PT.
-    print(f"[pipeline] step 2b: runway end-pad detection (stroked, flush)")
-    end_pad_set = detect_runway_end_pads(
-        all_polys, runway_indices=rwy_set, claimed_polys=claimed,
+    # ---- Step 2b: paired stroked outlines (rule-based) ---------------
+    # FAA charts draw each gray taxiway as TWO stacked polygons: a
+    # filled gray polygon (caught by step 1) AND a separate stroked
+    # outline polygon. Without an explicit claim, the outline falls
+    # through to step 7's stroked-only sweep and ends up on Other,
+    # leaving the rendered Taxiways layer with the fill but no border.
+    # The detection test is centroid-in-fill: a stroked-unfilled
+    # polygon whose centroid sits inside one of the filled-Taxi
+    # polygons. See taxi_detection.detect_paired_stroked_outlines.
+    print(f"[pipeline] step 2b: paired stroked taxiway outlines")
+    taxi_fill_set: set[int] = set(surf_set)  # step-1 fills only — used by
+                                              # step 3b's centerline search.
+    outline_set = detect_paired_stroked_outlines(
+        all_polys, taxi_surface_indices=taxi_fill_set,
+        claimed_polys=claimed,
     )
-    print(f"  end pads: {len(end_pad_set)}")
-    # End pads ARE taxi surfaces, so fold them into surf_set /
-    # taxi_surfaces. Step 4 (taxi-label K-nearest claim) tests
-    # bbox-touches-taxi-surface; a taxi label letter painted on a hold
-    # pad pavement should match, so the pads must participate in that
-    # gate.
-    surf_set |= end_pad_set
+    print(f"  outlines: {len(outline_set)}")
+    # Outlines render alongside their fills, so they go on Taxiways.
+    # Step 4 (taxi-label K-nearest gate) uses bbox-touches-taxi-surface;
+    # adding outlines doesn't change that check materially because each
+    # outline's bbox matches its fill twin.
+    surf_set |= outline_set
     taxi_surfaces = [all_polys[i] for i in sorted(surf_set)]
-    claimed |= end_pad_set
+    claimed |= outline_set
 
     # ---- Step 3: runway-label centerline-token search ----------------
     # Done BEFORE taxi-label matching so digit-glyph polygons that
@@ -451,8 +454,12 @@ def main():
     # translate_y; render_svg_layers applies it as an SVG transform.
     # See runway_label_layout.py for the full algorithm + rationale.
     print(f"[pipeline] step 3b: runway-label move along centerline")
+    # Pass the step-1 FILLED Taxi indices only — not the step-2b
+    # outlines. Outlines duplicate fill geometry, so including them
+    # in the contiguous-extension search creates ambiguous matches
+    # ("which of the two coincident polygons is the extension?").
     label_translations, step3b_diag = compute_runway_label_translations(
-        all_polys, step3_diag, taxi_indices=surf_set,
+        all_polys, step3_diag, taxi_indices=taxi_fill_set,
     )
     args.out.with_suffix(".step3b.json").write_text(
         json.dumps(step3b_diag, indent=2, default=str)
@@ -487,11 +494,10 @@ def main():
         final_label[i] = "Taxiways"
         final_top[i] = "Taxiways"
         final_override[i] = True
-        # Distinguish gray-fill surfaces from runway-end pads for
-        # diagnostics — both go on the Taxiways layer, but the source
-        # label tells you which rule made the claim.
+        # Distinguish step-1 fills from step-2b outlines in the
+        # diagnostics. Both go on the Taxiways layer.
         final_source[i] = (
-            "rule_runway_end_pad" if i in end_pad_set
+            "rule_taxi_outline" if i in outline_set
             else "rule_taxi_surface"
         )
 

@@ -123,31 +123,24 @@ Labels) are claimed in steps 1–3 before ML runs.
    in its scissor is claimed (this is how F45's grass strip — drawn
    only as a clipped hatch pattern — gets picked up).
 
-   **2b. Runway end pads (rule-based).** A second source for Taxiways.
-   FAA chart convention draws runway run-up / hold pads at the
-   threshold as **stroked-only rectangles** (not gray-filled), so step 1
-   misses them and step 7's stroked-only sweep would otherwise demote
-   them to Other. The current ML head (v25) emits only Footprints /
-   Stars / Other so it can't route them either. The rule is deliberately
-   tight — pads sit practically touching the runway when they exist:
-   - Candidate must be stroked AND not filled AND unclaimed.
-   - At least one anchor of the candidate polygon must project past one
-     of the runway's longitudinal ends on its principal axis AND lie
-     within the centerline band (`half_wid + 5pt`) laterally — this is
-     the "polygon sits on the extended centerline past the threshold"
-     test, computed from anchor projections so chart rotation is exact.
-   - Polygon-boundary-to-polygon-boundary minimum distance between the
-     candidate and the runway must be ≤ **5pt** (tolerance constant
-     `RUNWAY_END_PAD_MAX_DISTANCE_PT` in `taxi_detection.py`). Distances
-     are anchor-of-one-against-segments-of-the-other, so they don't
-     depend on bbox alignment — bbox-based math is wrong on rotated
-     runways.
-
-   Bbox tests are deliberately avoided in step 2b. FAA charts rotate
-   runways arbitrarily on the page; an axis-aligned bbox of a rotated
-   runway gives misleading "ends" and would falsely admit polygons
-   along the bbox edge. The principal-axis anchor projection is exact
-   for any rotation.
+   **2b. Paired stroked outlines (rule-based).** A second source for
+   Taxiways. FAA charts draw each gray taxiway as TWO stacked
+   polygons — a filled gray polygon AND a separate stroked-unfilled
+   outline drawn on top. Step 1 catches the filled polygon; this step
+   claims the matching outline so the rendered Taxiways layer carries
+   both fill and border. Detection test: the stroked-unfilled
+   polygon's centroid sits inside one of the filled-Taxi polygons.
+   Centroid-in-fill is robust because:
+   - A polygon's outline shares its filled twin's centroid exactly.
+   - Arbitrary stroked artwork near pavement (centerline marks,
+     threshold stripes, arrowheads, line-art annotations) does NOT
+     have its centroid sitting inside a gray-fill region — those
+     artifacts live at the boundary or outside.
+   - A 1-D line segment's centroid is on the line, which is not
+     inside any 2-D fill region unless the line genuinely overlaps
+     pavement, in which case it is visually part of the taxiway.
+   Implemented in [`python/taxi_detection.py`](python/taxi_detection.py)
+   as `detect_paired_stroked_outlines`.
 
 3. **Runway + Taxiway Labels (rule-based).** Two passes, runway-first.
    *Runway Labels:* for each rule-claimed Runway, compute its principal
@@ -166,23 +159,42 @@ Labels) are claimed in steps 1–3 before ML runs.
    **3b. Runway-label move along the centerline (layout).** Layout-
    only step — does NOT change which layer any polygon is on.
    Implemented in [`python/runway_label_layout.py`](python/runway_label_layout.py).
-   For every label group claimed in step 3, finds the contiguous
-   pavement extension at that runway end (a Taxiway whose boundary is
-   within **1pt** of the runway boundary AND has at least one anchor
-   past this end on the centerline AND the outward centerline ray
-   actually crosses its boundary — this last gate rejects aprons
-   adjacent to the runway *side* that aren't true centerline
-   extensions). Casts the ray from the runway-end point along the
-   principal axis; the largest ray-vs-boundary `t` is the centerline
-   exit. The label group's nearest-glyph anchor (computed from actual
-   polygon anchors, NOT bbox — an angled "22L" has empty bbox corners
-   that would push the visible glyph too far) is repositioned to land
-   `2pt` past the centerline exit by a single rigid translation
-   applied to every polygon in the group. If no extension is found,
-   the label lands `2pt` past the runway end itself. The translation
-   per polygon is carried through the predictions JSON as
-   `translate_x` / `translate_y` and applied as an SVG `transform="translate(…)"`
-   in step 3 (renderer) — original PDF geometry stays intact.
+   For every label group claimed in step 3, picks the **first
+   filled-Taxi polygon along the extended centerline past this end**
+   and aligns the label `2pt` past that polygon's far edge. The
+   translation has TWO components combined into one rigid `(dx, dy)`
+   applied to every polygon in the group:
+
+   - **Longitudinal**: cast a ray from the runway-end point along the
+     outward principal axis. The first filled-Taxi polygon the ray
+     enters is the contiguous extension — its smallest ray-vs-boundary
+     intersection is `near_t`, its largest is `far_t`. The label's
+     nearest-glyph anchor (computed from actual polygon anchors, NOT
+     bbox — an angled "22L" has empty bbox corners that would push the
+     visible glyph too far) is shifted to land at
+     `half_len + far_t + 2pt` along the outward axis. If the runway
+     end happens to sit INSIDE the polygon (gray fill extending across
+     the threshold, common on FAA charts), `near_t` is treated as 0.
+     Sanity gate: `near_t ≤ 1pt` so a polygon 30pt past the threshold
+     across a gap doesn't get picked.
+
+   - **Lateral**: also center the group on the centerline. The label's
+     anchor-bounds midpoint perpendicular to the runway axis is
+     computed from actual polygon anchors (`(lat_min + lat_max) / 2`),
+     and the group is shifted so that midpoint sits at `lat = 0`.
+     Without this, labels drawn slightly off-axis (left or right of
+     the centerline in the source PDF) would still be off-axis after
+     the longitudinal move.
+
+   The contiguous-extension finder considers ONLY filled-Taxi polygons
+   (step 1 fills, NOT the step 2b stroked outlines) — outlines
+   duplicate fill geometry and would create ambiguous "first along
+   centerline" matches.
+
+   The translation per polygon is carried through the predictions JSON
+   as `translate_x` / `translate_y` and applied as an SVG
+   `transform="translate(...)"` per `<path>` in step 3 (renderer) —
+   original PDF geometry stays intact.
 
 4. **Concave-hull rejection (pre-ML).** Build a concave hull
    (`shapely.concave_hull(ratio=0.0)`, no buffer) over the rule-claimed

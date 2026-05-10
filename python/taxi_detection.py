@@ -9,13 +9,16 @@ Detection logic:
     (~#cfcfcf, with leeway for chart variation). Detection of the gray
     fill itself happens in chart_scene.read_chart and is exposed via
     the `is_taxi_surface` flag on each polygon dict.
-  - Taxiway surface (runway end pad): unfilled stroked polygon sitting
-    flush with a rule-claimed runway's longitudinal end. These are
-    run-up / hold pads — drawn as stroked-only rectangles by FAA chart
-    convention rather than filled gray. Without an explicit claim, the
-    final stroked-only sweep in classify_pipeline demotes them to
-    Other; ML can't rescue them either (the v25 head emits only
-    Footprints/Stars/Other). See `detect_runway_end_pads`.
+  - Taxiway surface (paired stroked outline): a stroked-unfilled polygon
+    whose centroid lies inside one of the gray-fill Taxiways. FAA charts
+    draw each gray taxi surface (including hold pads) as a filled gray
+    polygon AND a separate stroked outline polygon stacked on top.
+    Step 1 catches the gray fill; without this rule the matching outline
+    would be demoted to Other by the final stroked-only sweep, breaking
+    the visual when the Taxiways layer is rendered. Centroid-in-filled-
+    taxi uniquely identifies the outline relationship — arbitrary lines
+    or markings near pavement do not have their centroid inside a
+    gray-fill polygon. See `detect_paired_stroked_outlines`.
   - Taxiway label: a word token matching `^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$`
     (e.g. "C", "C1", "A11", "3") whose bbox touches a taxi surface
     polygon. The K = len(token) nearest unclaimed near-black filled
@@ -40,12 +43,19 @@ Public:
         Run only the K-nearest claim, given an externally-loaded
         scene and a set of polygon indices already claimed by other
         steps. Production pipeline calls this directly.
-    detect_runway_end_pads(all_polys, runway_indices,
-                           claimed_polys=None, max_distance=5.0)
-                           -> set[int]
-        Find stroked-unfilled run-up/hold pads sitting flush with a
-        runway's longitudinal end. Production pipeline calls this
-        between rule-based runway detection and runway-label matching.
+    detect_paired_stroked_outlines(all_polys, taxi_surface_indices,
+                                   claimed_polys=None) -> set[int]
+        Find stroked-unfilled polygons whose centroid sits inside any
+        already-claimed gray-fill Taxiway. These are the outline-on-fill
+        companion polygons that FAA charts draw over each taxi surface.
+    _runway_extents(subpaths, fallback_rect) -> 6-tuple
+        (cx, cy, ux, uy, half_len, half_wid) — runway principal-axis
+        center, unit direction, and half-extents in long/lat. Re-used
+        by runway_label_layout.py.
+    _min_polygon_boundary_distance(sp_a, sp_b) -> float
+        Approximate min boundary-to-boundary distance between two
+        compound polygons. Used by runway_label_layout.py for the
+        contiguous-extension touching test.
 """
 
 from __future__ import annotations
@@ -202,28 +212,6 @@ def _runway_extents(subpaths: list[list[tuple[float, float]]],
     return (cx, cy, ux, uy, half_len, half_wid)
 
 
-# Tight tolerance for runway-end-pad detection. Run-up / hold pads on
-# FAA charts are drawn flush with the runway threshold — the stroke of
-# the pad and the stroke/edge of the runway are practically coincident.
-# 5pt is "almost touching"; loosening this risks pulling in arrowheads
-# or annotation rectangles that happen to live near a runway end.
-RUNWAY_END_PAD_MAX_DISTANCE_PT = 5.0
-
-# Minimum extent in the candidate's own minor (PCA) direction for it
-# to qualify as a hold pad. Measured in the candidate's intrinsic
-# frame, NOT bbox or runway frame:
-#   - bbox is wrong on diagonal lines (a 2.88pt line at 35° gives
-#     a square-ish bbox with both dims ≈1.6pt)
-#   - runway-frame projection is wrong for the same reason — projecting
-#     a non-aligned line onto an arbitrary axis gives non-zero in both
-#     directions
-#   - PCA minor extent ≈ 0 for any set of collinear anchors, regardless
-#     of orientation, which is exactly the property we want.
-# A real hold pad has meaningful 2-D extent (its narrow dimension is
-# at least a few points). A stroked centerline mark, threshold stripe,
-# or approach-line indicator collapses to ~0 perpendicular to its
-# long axis.
-MIN_PAD_DIMENSION_PT = 3.0
 
 
 def _point_to_segment_distance(px: float, py: float,
@@ -300,125 +288,71 @@ def _min_polygon_boundary_distance(
     return min_d
 
 
-def detect_runway_end_pads(all_polys: list[dict],
-                           runway_indices,
-                           claimed_polys: set[int] | None = None,
-                           max_distance: float = RUNWAY_END_PAD_MAX_DISTANCE_PT
-                           ) -> set[int]:
-    """Find stroked-unfilled polygons sitting flush with a rule-claimed
-    runway's longitudinal end. These are taxiway run-up / hold pads —
-    drawn by FAA chart convention as stroked-only rectangles instead of
-    filled gray, so the gray-fill rule (step 1) misses them.
+def detect_paired_stroked_outlines(
+    all_polys: list[dict],
+    taxi_surface_indices,
+    claimed_polys: set[int] | None = None,
+) -> set[int]:
+    """Find stroked-unfilled polygons that are visual outlines of an
+    already-claimed gray-fill taxi surface — i.e. their centroid lies
+    inside one of the filled-Taxi polygons.
 
-    Why this is a *narrow* rule and not an ML class:
-      - The pads sit practically touching the runway when they exist;
-        a 5pt tolerance is sufficient and avoids false positives.
-      - Step 7 of classify_pipeline (the stroked-only sweep) demotes
-        any surviving stroked polygon to Other, so without an explicit
-        rule claim these pads end up on the Other layer regardless of
-        what ML thinks.
-      - The current ML head (v25) emits only Footprints / Stars / Other
-        and so cannot route these polygons to Taxiways even if step 7
-        were relaxed.
+    Why this rule exists
+    --------------------
+    FAA airport diagrams draw each gray taxiway (apron, run-up area,
+    hold pad, taxi segment) as TWO stacked polygons:
+      1. A filled gray polygon — the pavement fill (caught by step 1).
+      2. A separate stroked-unfilled polygon over it — the pavement
+         outline.
+    Both are part of the visible taxiway. Without this rule the
+    outline polygon falls through to step 7's stroked-only sweep and
+    ends up on Other, leaving the rendered Taxiways layer with the
+    fill but no outline.
 
-    Detection geometry — works in the runway's principal-axis frame
-    (NOT bboxes, which are misleading on rotated runways):
-
-      1. Candidate is stroked AND NOT filled AND not already claimed.
-      2. Candidate has at least one anchor point that is BOTH past one
-         of the runway's longitudinal ends AND within the centerline
-         band laterally (|lat| ≤ half_wid + max_distance). This is the
-         "polygon sits on the extended centerline past the threshold"
-         test, computed from anchor projections so chart rotation is
-         handled exactly.
-      3. Candidate has meaningful 2-D extent in its OWN PCA frame:
-         minor-axis extent ≥ MIN_PAD_DIMENSION_PT. Rejects 1-D
-         strokes near the threshold (centerline-extension marks,
-         threshold stripes, approach-line indicators) that pass
-         gates 1, 2, and 4 but aren't pads. PCA minor extent is
-         used because runway-frame projection of an off-axis line
-         gives non-zero on both axes — the only frame in which a
-         line collapses to 0 is its own intrinsic frame.
-      4. Polygon-boundary-to-polygon-boundary minimum distance between
-         the candidate and the runway is ≤ max_distance. This is the
-         "practically touching" test — measured anchor-of-one against
-         segments-of-the-other (exact for non-intersecting polygons in
-         2D), so it doesn't depend on bbox alignment.
+    The detection test
+    ------------------
+    A stroked-unfilled polygon's centroid is inside one of the filled-
+    Taxi polygons. Centroid-in-fill is a robust proxy for the
+    fill/outline pairing because:
+      - A polygon's stroked outline shares its filled twin's centroid
+        exactly (same shape, same anchor extent).
+      - Arbitrary stroked artwork near pavement (centerline marks,
+        threshold stripes, arrowheads, line-art annotations) does NOT
+        have its centroid sitting inside a gray-fill region — those
+        live at the boundary or outside.
+      - 1-D line segments fail the test naturally: a line's centroid
+        is on the line itself, which is not inside any 2-D fill region
+        unless the line genuinely overlaps the pavement, in which case
+        it IS visually part of the taxiway and belongs on Taxiways
+        anyway.
 
     Args:
         all_polys: full polygon list from chart_scene.read_chart.
-        runway_indices: indices in all_polys claimed as Runways by
-            step 2.
-        claimed_polys: indices already claimed by earlier steps; these
-            are skipped.
-        max_distance: longitudinal/lateral/boundary tolerance in
-            points; default 5pt. See module-level
-            RUNWAY_END_PAD_MAX_DISTANCE_PT.
+        taxi_surface_indices: indices already claimed as Taxiways by
+            step 1 (gray-fill detection).
+        claimed_polys: indices already claimed by any step; skipped.
 
-    Returns set of polygon indices to add to the Taxiways layer.
+    Returns:
+        set of polygon indices to add to the Taxiways layer.
     """
     claimed = set(claimed_polys or [])
-    pad_indices: set[int] = set()
-    for ri in runway_indices:
-        rp = all_polys[ri]
-        rwy_subpaths = rp.get("subpaths") or []
-        cx, cy, ux, uy, half_len, half_wid = _runway_extents(
-            rwy_subpaths, rp["rect"]
-        )
-        # Lateral band for "on the extended centerline" — runway lateral
-        # half-width plus the same touching tolerance. Hold-pad shoulders
-        # sometimes flare a few points wider than the runway proper, so
-        # we accept anchors slightly outside the runway's lateral
-        # footprint. Anchors farther out laterally are rejected because
-        # they're not on the centerline at all (e.g. stroked annotation
-        # off to the side).
-        lat_band = half_wid + max_distance
-        for i, p in enumerate(all_polys):
-            if i in claimed or i in pad_indices:
+    surfaces = [all_polys[i] for i in taxi_surface_indices]
+    outline_indices: set[int] = set()
+    for i, p in enumerate(all_polys):
+        if i in claimed:
+            continue
+        if not p.get("stroked") or p.get("filled"):
+            continue
+        cx, cy = p["cx"], p["cy"]
+        for s in surfaces:
+            sx0, sy0, sx1, sy1 = s["rect"]
+            # Cheap bbox prefilter before the ray-cast.
+            if not (sx0 <= cx <= sx1 and sy0 <= cy <= sy1):
                 continue
-            if not p.get("stroked") or p.get("filled"):
-                continue
-            cand_subpaths = p.get("subpaths") or []
-            if not cand_subpaths:
-                continue
-            # Gate 2: any anchor on the extended centerline past
-            # an end? Also collect anchors for the PCA gate below.
-            on_centerline_past_end = False
-            anchors: list[tuple[float, float]] = []
-            for ring in cand_subpaths:
-                for ax_, ay_ in ring:
-                    anchors.append((ax_, ay_))
-                    dxv = ax_ - cx
-                    dyv = ay_ - cy
-                    long_pos = dxv * ux + dyv * uy
-                    lat = -dxv * uy + dyv * ux
-                    if (abs(long_pos) > half_len
-                            and abs(lat) <= lat_band):
-                        on_centerline_past_end = True
-            if not on_centerline_past_end:
-                continue
-            # Gate 3: PCA minor-axis extent. A real hold pad has
-            # meaningful 2-D extent in its own intrinsic frame; a
-            # 1-D stroke (collinear anchors at any orientation)
-            # collapses to ~0 along its minor axis. Need ≥ 3
-            # anchors for a meaningful PCA — fewer than that is by
-            # definition either degenerate (1 pt) or a single line
-            # segment (2 pts), both rejected.
-            if len(anchors) < 3:
-                continue
-            arr = np.asarray(anchors, dtype=float)
-            centered = arr - arr.mean(axis=0)
-            _, _, vt = np.linalg.svd(centered, full_matrices=False)
-            minor_proj = centered @ vt[1]
-            minor_extent = float(minor_proj.max() - minor_proj.min())
-            if minor_extent < MIN_PAD_DIMENSION_PT:
-                continue
-            # Gate 4: polygon boundaries practically touching.
-            d = _min_polygon_boundary_distance(rwy_subpaths, cand_subpaths)
-            if d > max_distance:
-                continue
-            pad_indices.add(i)
-    return pad_indices
+            if _point_in_subpaths(cx, cy, s.get("subpaths") or []):
+                outline_indices.add(i)
+                break
+    return outline_indices
 
 
 def detect_taxi(pdf_path: Path) -> dict:

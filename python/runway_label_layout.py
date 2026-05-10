@@ -32,21 +32,33 @@ Algorithm — per (runway, end, label_polygon_indices) triple
   1. Principal axis of the runway via PCA: (cx, cy, ux, uy, half_len).
      Outward unit vector for this end is end_sign * (ux, uy).
      Runway-end point on this side: (cx, cy) + half_len * outward.
-  2. Find the contiguous extension polygon at this end (at most one
-     by chart convention):
-       - It must have at least one anchor projecting past THIS end on
-         the centerline (end_sign * long_pos > half_len). This rejects
-         a perpendicular taxiway that crosses the runway in the
-         middle and would otherwise be ambiguous between the two ends.
-       - Its polygon-boundary-to-runway-boundary minimum distance
-         must be <= CONTIGUITY_TOLERANCE_PT (1pt). True extensions
-         drawn in FAA charts share the runway edge to within drawing
-         precision; 1pt rejects unrelated taxiways the centerline
-         might happen to clip far away.
-  3. Cast a ray from the runway-end point along the outward unit.
-     If an extension is found, find its centerline exit — the largest
-     t > 0 at which the ray crosses one of its boundary segments.
-     If no extension, t_exit = 0.
+  2. Cast a ray from the runway-end point along the outward unit.
+     For each filled-Taxi polygon, compute every ray-vs-boundary
+     intersection. Pick the polygon whose smallest intersection
+     ("near_t") is closest to the runway end (i.e. the FIRST polygon
+     the centerline encounters past the threshold). The polygon's
+     largest intersection ("far_t") is the centerline exit — where
+     the ray walks out of that polygon's pavement, and where the
+     label needs to clear by `label_clearance` points.
+       - Sanity gate: near_t must be ≤ CONTIGUITY_TOLERANCE_PT (1pt).
+         Any larger and the polygon doesn't actually start at the
+         threshold — there's a gap, and we don't want to align across
+         it.
+       - This finder takes only FILLED-Taxi indices as candidates, NOT
+         the stroked outlines from step 2b. Outlines duplicate fill
+         geometry; including them would make "first polygon along
+         centerline" ambiguous between the fill and its outline twin.
+  3. If no polygon passes, t_exit = 0 and the label lands 2pt past the
+     runway end itself.
+  4. Lateral centering. The translation also has a perpendicular-to-
+     centerline component so the label group's lateral bounds midpoint
+     sits exactly on the extended centerline (lat = 0). This handles
+     the case where a label group was originally drawn slightly off-
+     axis from the runway — without this, the label would still be
+     pushed 2pt past the pavement but offset to one side. The midpoint
+     is computed from the actual anchor-point min/max lat (NOT bbox)
+     so an asymmetric token like "9R" doesn't get pulled off-center
+     by the wider R glyph.
   4. Compute current label inner edge:
        current_inner = min over all anchors of all label polygons of
                        end_sign * ((px - cx) * ux + (py - cy) * uy)
@@ -82,7 +94,7 @@ from __future__ import annotations
 
 import math
 
-from taxi_detection import _min_polygon_boundary_distance, _runway_extents
+from taxi_detection import _point_in_subpaths, _runway_extents
 
 
 CONTIGUITY_TOLERANCE_PT = 1.0
@@ -137,88 +149,78 @@ def _ray_segment_intersection_t(rx: float, ry: float,
 
 
 # ---------------------------------------------------------------------------
-# Contiguous-extension search
+# First-extension-along-centerline search
 # ---------------------------------------------------------------------------
 
-def _has_anchor_past_end(poly: dict,
-                         cx: float, cy: float,
-                         ux: float, uy: float,
-                         half_len: float,
-                         end_sign: int) -> bool:
-    """True if at least one anchor of `poly` projects past THIS end on
-    the runway's principal axis. This is the gate that says "the
-    polygon extends in the outward direction from this specific end."
-    """
-    for px, py in _iter_anchors(poly):
-        long_pos = (px - cx) * ux + (py - cy) * uy
-        if end_sign * long_pos > half_len:
-            return True
-    return False
-
-
-def _find_contiguous_extension(
-    runway_poly: dict,
+def _first_extension_along_centerline(
     candidate_polys_by_idx: dict[int, dict],
-    cx: float, cy: float, ux: float, uy: float,
-    half_len: float, end_sign: int,
-    contiguity_tolerance: float,
-) -> tuple[int, dict] | None:
-    """Locate the single Taxiway polygon contiguous with the runway at
-    this specific end. Returns (idx, poly) or None.
+    rwy_end_x: float, rwy_end_y: float,
+    out_ux: float, out_uy: float,
+    near_tolerance: float,
+) -> tuple[int, float, float] | None:
+    """Cast a ray outward from the runway-end point along
+    (out_ux, out_uy) and return the FIRST candidate polygon the ray
+    enters — the one whose entry intersection (smallest t > 0) is
+    closest to the runway end. Returns (idx, near_t, far_t) or None.
 
-    Two gates:
-      1. At least one anchor past THIS end on the centerline
-         (rejects perpendicular crossings in the middle of the runway
-         and extensions belonging to the OTHER end).
-      2. Polygon-boundary-to-runway-boundary distance <=
-         contiguity_tolerance (rejects far-off taxiways the
-         centerline ray might clip).
+    Why "first along centerline" instead of "closest by polygon-
+    boundary distance":
+      - Two adjacent gray-fill Taxiways (a hold pad at the threshold
+        and the apron immediately behind it) can BOTH touch the runway
+        boundary, so a "min boundary distance" tiebreaker becomes
+        arbitrary iteration order. The user observed this as the
+        algorithm picking the LATER polygon and aligning the label
+        past its far end instead of the first polygon's far end.
+      - The label sits on the centerline. What matters for label
+        positioning is the FIRST polygon the centerline encounters
+        past the threshold, and that polygon's FAR edge (where the
+        label clears the pavement). Geometric ray-vs-boundary directly
+        captures that: a polygon's "near_t" is exactly its centerline
+        entry point.
 
-    Defensive: if more than one candidate passes both gates (not
-    expected in practice), pick the one whose boundary is closest to
-    the runway.
+    near_tolerance: maximum allowed near_t. The polygon must START at
+        or near the runway end (gap ≤ near_tolerance), not be a
+        polygon 30pt past it across a gap.
     """
-    rwy_subpaths = runway_poly.get("subpaths") or []
-    matches: list[tuple[int, dict, float]] = []
+    best_near_t = math.inf
+    best_far_t = 0.0
+    best_idx: int | None = None
     for idx, poly in candidate_polys_by_idx.items():
-        if not _has_anchor_past_end(poly, cx, cy, ux, uy, half_len,
-                                     end_sign):
+        sp = poly.get("subpaths") or []
+        if not sp:
             continue
-        cand_subpaths = poly.get("subpaths") or []
-        if not cand_subpaths:
-            continue
-        d = _min_polygon_boundary_distance(rwy_subpaths, cand_subpaths)
-        if d <= contiguity_tolerance:
-            matches.append((idx, poly, d))
-    if not matches:
+        # If the runway-end point is INSIDE the polygon, near_t = 0 —
+        # the polygon already contains the threshold and the ray
+        # starts within it. This is the common case on FAA charts
+        # where the gray fill extends across the runway threshold,
+        # so a strict "ray must enter from outside" check would
+        # otherwise miss the actual contiguous extension.
+        point_inside = _point_in_subpaths(rwy_end_x, rwy_end_y, sp)
+        ts: list[float] = []
+        for (ax, ay), (bx, by) in _polygon_segments(sp):
+            t = _ray_segment_intersection_t(
+                rwy_end_x, rwy_end_y, out_ux, out_uy,
+                ax, ay, bx, by,
+            )
+            if t is not None and t > 0.0:
+                ts.append(t)
+        if point_inside:
+            near_t = 0.0
+            far_t = max(ts) if ts else 0.0
+        else:
+            if not ts:
+                continue
+            near_t = min(ts)
+            if near_t > near_tolerance:
+                continue
+            far_t = max(ts)
+        if near_t < best_near_t:
+            best_near_t = near_t
+            best_far_t = far_t
+            best_idx = idx
+    if best_idx is None:
         return None
-    matches.sort(key=lambda m: m[2])
-    idx, poly, _ = matches[0]
-    return idx, poly
-
-
-def _centerline_exit_t(extension_poly: dict,
-                       rwy_end_x: float, rwy_end_y: float,
-                       out_ux: float, out_uy: float) -> float:
-    """Cast a ray from (rwy_end_x, rwy_end_y) along (out_ux, out_uy)
-    and return the largest t > 0 at which the ray crosses any
-    boundary segment of `extension_poly`. This is the centerline
-    exit — where the ray walks OUT of the extension polygon.
-
-    Returns 0.0 if no intersection found, which means the centerline
-    ray doesn't actually cross the extension (rare; possible if the
-    extension lies entirely off the centerline, in which case it
-    shouldn't have qualified as contiguous in the first place).
-    """
-    max_t = 0.0
-    for (ax, ay), (bx, by) in _polygon_segments(
-            extension_poly.get("subpaths") or []):
-        t = _ray_segment_intersection_t(
-            rwy_end_x, rwy_end_y, out_ux, out_uy, ax, ay, bx, by,
-        )
-        if t is not None and t > max_t:
-            max_t = t
-    return max_t
+    return best_idx, best_near_t, best_far_t
 
 
 # ---------------------------------------------------------------------------
@@ -250,10 +252,11 @@ def compute_runway_label_translations(
                      `_match_runway_labels`. Only entries with
                      `matched=True` and a non-empty `claimed` list
                      drive a move.
-      taxi_indices:  iterable of polygon indices currently classified
-                     as Taxiways (gray-fill surfaces + end-pads from
-                     step 2b). The contiguous-extension search only
-                     considers these.
+      taxi_indices:  iterable of FILLED-Taxi polygon indices (step 1
+                     gray fills only). Stroked outlines from step 2b
+                     should NOT be included — they duplicate the fill
+                     geometry and would create ambiguous "first along
+                     centerline" matches.
     """
     translations: dict[int, tuple[float, float]] = {}
     diagnostics: list[dict] = []
@@ -276,50 +279,69 @@ def compute_runway_label_translations(
         rwy_end_x = cx + half_len * out_ux
         rwy_end_y = cy + half_len * out_uy
 
-        extension = _find_contiguous_extension(
-            rwy_poly, candidate_polys_by_idx,
-            cx, cy, ux, uy, half_len, end_sign,
-            contiguity_tolerance,
+        # Find the FIRST filled-Taxi polygon along the extended
+        # centerline past this end. Use that polygon's FAR edge for
+        # alignment — the label clears its visible pavement.
+        first = _first_extension_along_centerline(
+            candidate_polys_by_idx,
+            rwy_end_x, rwy_end_y, out_ux, out_uy,
+            near_tolerance=contiguity_tolerance,
         )
-        if extension is not None:
-            ext_idx, ext_poly = extension
-            t_exit = _centerline_exit_t(
-                ext_poly, rwy_end_x, rwy_end_y, out_ux, out_uy,
-            )
-            # A polygon can satisfy "boundary touches runway" and "has
-            # an anchor past this end" while still being just an apron
-            # adjacent to the runway's SIDE rather than an extension
-            # at this end. The decisive geometric test is whether the
-            # outward centerline ray actually crosses the polygon: if
-            # t_exit is 0 the ray never enters it, so it isn't a
-            # true centerline extension. Treat as "no extension" and
-            # let the label fall back to "2pt past runway end".
-            if t_exit <= 0.0:
-                ext_idx = None
-                t_exit = 0.0
+        if first is not None:
+            ext_idx, near_t, t_exit = first
         else:
             ext_idx = None
+            near_t = None
             t_exit = 0.0
 
-        # Current label inner edge — the smallest outward-projection
-        # of any anchor in the group. This is the glyph anchor closest
-        # to the runway (along the centerline). Bbox is deliberately
-        # NOT used — see module docstring for why.
+        # Scan every anchor of every polygon in the label group ONCE,
+        # collecting both:
+        #   - current_inner: smallest outward-projection (glyph anchor
+        #     closest to the runway). Drives the longitudinal move.
+        #   - lat_min / lat_max: range of lateral positions across the
+        #     whole group's anchors. Drives the lateral centering move.
+        # Bbox is deliberately NOT used — an angled label has empty
+        # bbox corners that misrepresent the actual visible glyph
+        # extent (see module docstring).
         current_inner = math.inf
+        lat_min = math.inf
+        lat_max = -math.inf
         for li in claimed_indices:
             for px, py in _iter_anchors(all_polys[li]):
-                outward_pos = end_sign * (
-                    (px - cx) * ux + (py - cy) * uy
-                )
+                long_pos_signed = (px - cx) * ux + (py - cy) * uy
+                outward_pos = end_sign * long_pos_signed
                 if outward_pos < current_inner:
                     current_inner = outward_pos
-        if not math.isfinite(current_inner):
+                lat = -(px - cx) * uy + (py - cy) * ux
+                if lat < lat_min:
+                    lat_min = lat
+                if lat > lat_max:
+                    lat_max = lat
+        if not math.isfinite(current_inner) or not math.isfinite(lat_min):
             continue
 
+        # Longitudinal component: place the inner edge `label_clearance`
+        # past the centerline exit of the chosen extension (or past
+        # the runway end if no extension).
         target_inner = half_len + t_exit + label_clearance
-        delta = target_inner - current_inner
-        dx = delta * out_ux
-        dy = delta * out_uy
+        delta_long = target_inner - current_inner
+
+        # Lateral component: center the label group's anchor-bounds
+        # midpoint on the centerline (lat = 0). Using the midpoint of
+        # min/max lateral anchor positions matches "the actual bounds
+        # of the art" regardless of glyph asymmetry — for an
+        # asymmetric token like "9R" the wide R doesn't pull the
+        # lateral center off where it should be.
+        lat_center = (lat_min + lat_max) / 2.0
+        delta_lat = -lat_center
+
+        # Combine into one (dx, dy). Longitudinal moves along the
+        # outward direction (out_ux, out_uy); lateral moves along the
+        # principal-axis perpendicular (-uy, ux). The lateral basis
+        # is independent of end_sign — perpendicular to the runway is
+        # the same regardless of which end you are facing.
+        dx = delta_long * out_ux + delta_lat * (-uy)
+        dy = delta_long * out_uy + delta_lat * ux
 
         for li in claimed_indices:
             translations[li] = (dx, dy)
@@ -329,10 +351,13 @@ def compute_runway_label_translations(
             "end_sign": end_sign,
             "token": diag.get("token"),
             "extension_idx": ext_idx,
+            "near_t": near_t,
             "t_exit": t_exit,
             "current_inner": current_inner,
             "target_inner": target_inner,
-            "delta_along_centerline": delta,
+            "delta_along_centerline": delta_long,
+            "lat_center": lat_center,
+            "delta_lat": delta_lat,
             "dx": dx,
             "dy": dy,
             "claimed": claimed_indices,
