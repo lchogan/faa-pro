@@ -6,10 +6,14 @@
 #   bash classify.sh airports/bna-faa.pdf airports/atl-faa.pdf
 #
 # The PDF must be named <airport>-faa.pdf.
-# Produces <airport>-diagram.svg in the same folder as the PDF. Open the
-# SVG in Illustrator (File > Open) — top-level groups are tagged as
-# Inkscape layers, which Illustrator's SVG importer turns into native
-# layers. Save As .ai if you want the .ai extension.
+# Produces <airport>-diagram.svg in the same folder as the PDF. For
+# single-airport invocations the SVG is then opened in Illustrator,
+# saved as <airport>-diagram.ai, and reorganized via
+# PrepareForInspection.jsx (sublayers promoted out of "Layer 1",
+# layers sorted into the standard inspection stack, reference-only
+# layers locked + hidden). The .ai is left open for review. Set
+# OPEN_AFTER_CLASSIFY=0 to skip the Illustrator step; batch invocations
+# (more than one PDF) skip it automatically.
 #
 # Requires:
 #   - Python venv at faa-pro/.venv with deps installed
@@ -38,6 +42,51 @@ PYTHON="$PROJECT/.venv/bin/python3"
 # Default disables hull rejection (see header comment for rationale).
 PIPELINE_EXTRA="${PIPELINE_EXTRA:---skip-hull}"
 
+# Single-airport invocations get auto-opened in Illustrator. Batch
+# invocations (>1 arg) skip the open step to avoid a window per airport.
+# Set OPEN_AFTER_CLASSIFY=0 to disable, OPEN_AFTER_CLASSIFY=1 to force on.
+ARG_COUNT=$#
+if [[ -z "${OPEN_AFTER_CLASSIFY:-}" ]]; then
+    if [[ $ARG_COUNT -eq 1 ]]; then
+        OPEN_AFTER_CLASSIFY=1
+    else
+        OPEN_AFTER_CLASSIFY=0
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# prepare_for_inspection <svg-path>
+# Opens the SVG in Illustrator, runs PrepareForInspection.jsx, leaves the
+# resulting .ai open. Driven by a small JSON config the JSX reads.
+# ---------------------------------------------------------------------------
+prepare_for_inspection() {
+    local svg="$1"
+    local jsx="$PROJECT/PrepareForInspection.jsx"
+    local config="/tmp/faa_pro_inspection.json"
+
+    if [[ ! -f "$jsx" ]]; then
+        echo "   WARN: $jsx not found — skipping Illustrator open."
+        return 0
+    fi
+
+    cat > "$config" <<JSON
+{
+  "svg_path": "$svg"
+}
+JSON
+
+    osascript - "$jsx" <<'APPLESCRIPT' >/dev/null
+on run argv
+    set jsx_path to item 1 of argv
+    tell application "Adobe Illustrator"
+        activate
+        set scriptText to read (POSIX file jsx_path) as «class utf8»
+        do javascript scriptText
+    end tell
+end run
+APPLESCRIPT
+}
+
 # ---------------------------------------------------------------------------
 # process_one <pdf-path>
 # ---------------------------------------------------------------------------
@@ -64,7 +113,7 @@ process_one() {
     # ------------------------------------------------------------------
     # Step 1 — PyMuPDF: extract path CSV (no Illustrator)
     # ------------------------------------------------------------------
-    echo "   [1/3] PyMuPDF: extract paths..."
+    echo "   [1/4] PyMuPDF: extract paths..."
     "$PYTHON" "$PROJECT/python/extract_paths_fitz.py" \
         --pdf "$pdf" --airport "$airport" --out-dir "$folder" >/dev/null
 
@@ -83,7 +132,7 @@ process_one() {
     #          remaining unclaimed (5), stroked-only sweep (6). ML
     #          never sees polygons claimed in steps 1-3.
     # ------------------------------------------------------------------
-    echo "   [2/3] Pipeline: 6-step classification..."
+    echo "   [2/4] Pipeline: 6-step classification..."
     "$PYTHON" "$PROJECT/python/classify_pipeline.py" \
         --paths "$paths_csv" \
         --pdf "$pdf" \
@@ -102,7 +151,7 @@ process_one() {
     #          importer turns each into a native AI layer. ~1s vs the
     #          old JSX route's 60+s.
     # ------------------------------------------------------------------
-    echo "   [3/3] Render layered SVG..."
+    echo "   [3/4] Render layered SVG..."
     "$PYTHON" "$PROJECT/python/render_svg_layers.py" \
         --pdf "$pdf" \
         --predictions "$json_out" \
@@ -117,6 +166,20 @@ process_one() {
     rm -f "$paths_csv" "$edges_csv" "$pdf_text_csv"
 
     echo "   ✓ saved: $diagram_svg"
+
+    # ------------------------------------------------------------------
+    # Step 4 — Open in Illustrator and reorganize layers for inspection.
+    #          Saves as <airport>-diagram.ai, promotes SVG-import
+    #          sublayers out of "Layer 1", locks the reference-only
+    #          layers, and leaves the .ai open. Skipped on batch runs.
+    # ------------------------------------------------------------------
+    if [[ "$OPEN_AFTER_CLASSIFY" == "1" ]]; then
+        echo "   [4/4] Reorganize layers in Illustrator..."
+        prepare_for_inspection "$diagram_svg"
+        echo "   ✓ open in Illustrator: ${airport}-diagram.ai"
+    else
+        echo "   [4/4] Skipping Illustrator open (batch run or OPEN_AFTER_CLASSIFY=0)."
+    fi
 }
 
 # ---------------------------------------------------------------------------

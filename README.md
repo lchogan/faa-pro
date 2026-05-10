@@ -2,26 +2,64 @@
 
 Classifies vector objects in FAA airport diagram PDFs into semantic
 layers: **Taxiways, Taxiway Labels, Runways, Runway Labels, Footprints,
-Stars, Other**. Output is a layered SVG that opens in Adobe Illustrator
-with native AI layers (save-as `.ai` if you want the extension).
+Stars, Other**. Output is a layered SVG, plus — for single-airport
+runs — a layer-organized `.ai` opened in Illustrator ready for review.
 
 ## Quick start
+
+Single airport (default — opens in Illustrator when finished):
 
 ```bash
 bash classify.sh /path/to/<airport>-faa.pdf
 ```
 
-Produces `<airport>-diagram.svg` next to the source PDF. Open in
-Illustrator → File > Open. Each top-level group becomes a native
-Illustrator layer.
+Produces `<airport>-diagram.svg` next to the source PDF, then opens
+it in Illustrator, saves as `<airport>-diagram.ai`, reorganizes the
+layer panel via `PrepareForInspection.jsx`, and leaves the document
+open for review (see [Layer organization](#layer-organization-step-4)
+below).
+
+Batch (multiple airports — Illustrator step is skipped):
+
+```bash
+bash classify.sh airports/atl-faa.pdf airports/bna-faa.pdf airports/ord-faa.pdf
+```
 
 End-to-end on ORD (4331 polygons): **~7 seconds**, ~5 of which is the
-ML model.
+ML model. Step 4 (Illustrator open) adds a few seconds on top when it
+runs.
+
+### Auto-open behavior
+
+`classify.sh` decides whether to open the result in Illustrator by
+counting positional args:
+
+- **1 PDF arg** → opens in Illustrator after rendering (default).
+- **>1 PDF arg** → skips the Illustrator step so you don't end up with
+  one window per airport.
+
+Override with the `OPEN_AFTER_CLASSIFY` env var when you need different
+behavior:
+
+```bash
+# Single airport, but don't open in Illustrator
+OPEN_AFTER_CLASSIFY=0 bash classify.sh ord-faa.pdf
+
+# Batch, but force-open every airport (you'll get N windows)
+OPEN_AFTER_CLASSIFY=1 bash classify.sh atl-faa.pdf bna-faa.pdf
+```
+
+The Illustrator step requires Adobe Illustrator installed locally and
+accessible to AppleScript (`osascript`). On a machine without
+Illustrator, run with `OPEN_AFTER_CLASSIFY=0` and open the SVG by hand
+when convenient.
 
 ## The pipeline
 
-`classify.sh` orchestrates three Python steps. There is no Illustrator
-scripting in the production path.
+`classify.sh` orchestrates three Python steps plus an optional
+Illustrator step. There is no Illustrator scripting in the Python path
+itself — step 4 just opens the finished SVG and tidies up its layer
+panel.
 
 ```
 <airport>-faa.pdf
@@ -37,7 +75,28 @@ scripting in the production path.
         │  Step 3   render_svg_layers.py
         ▼
 <airport>-diagram.svg           ten <g> layers, Inkscape-tagged
+        │
+        │  Step 4   PrepareForInspection.jsx (single-airport only)
+        ▼
+<airport>-diagram.ai            opened in Illustrator, layers sorted
 ```
+
+### Layer organization (step 4)
+
+`PrepareForInspection.jsx` runs inside Illustrator on a single-airport
+run. It:
+
+1. Saves the SVG as `<airport>-diagram.ai` next to it.
+2. Promotes each SVG-import sublayer out of the "Layer 1" wrapper so
+   they sit at the document root.
+3. Ensures every target layer exists, including a manual-only **Lights**
+   placeholder that the classifier doesn't populate.
+4. Sorts the panel top-to-bottom into the standard inspection stack:
+   `Runway Labels → Taxiway Labels → Stars → Lights → Footprints →
+   Runways → Taxiways → Other → PDF Text Tokens → Metadata`.
+5. Locks and hides **Other**, **PDF Text Tokens**, and **Metadata** —
+   reference data, not part of the editable diagram.
+6. Saves the `.ai` and leaves it open for review.
 
 ### `classify_pipeline.py` — the 6 substeps
 
