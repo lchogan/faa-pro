@@ -43,18 +43,36 @@ from the pool seen by every later step.
                           string (e.g. APF runway "5" vs a hypothetical
                           taxi "5") still finds its own glyph
                           polygons elsewhere on the chart.
-  5.   ML                 On the remaining unclaimed polygons.
-                          Classes Taxiways / Taxiway Labels / Runway
-                          Labels / Runways are masked out of ML's
-                          probability matrix so an unclaimed polygon
-                          can't fall back into them.
-  6.   Hull rejection     Build a concave hull (no buffer) over the
+  5.   Hull rejection     Build a concave hull (no buffer) over the
                           rule-claimed Runways + Taxi surfaces'
-                          anchor points. Any polygon whose centroid
-                          sits outside the hull is demoted to Other.
-                          Runways, Taxi surfaces, Runway Labels, and
-                          Taxi Labels are exempt — rule-trusted, and
-                          labels can legitimately sit at chart edges.
+                          anchor points. Any polygon whose bbox
+                          doesn't intersect the hull is demoted to
+                          Other and removed from the ML pool. Runways,
+                          Taxiways, Runway Labels, and Taxi Labels are
+                          exempt — rule-trusted, and labels can
+                          legitimately sit at chart edges. Production
+                          runs with `--skip-hull` (set in classify.sh)
+                          because too many legitimate building
+                          footprints sit just outside the hull on real
+                          charts; the step is preserved for
+                          experimentation. Runs BEFORE ML so the model
+                          doesn't spend capacity on legend / scale-bar
+                          / note polygons.
+  6.   ML                 On the remaining unclaimed polygons.
+                          v25 head emits Footprints / Stars / Other
+                          only — Taxiways / Taxiway Labels / Runway
+                          Labels / Runways are not ML classes (claimed
+                          earlier by rule-based steps).
+  7.   Stroked sweep      Final pass: any polygon with `stroked &&
+                          !filled` AND not on the Runways layer is
+                          demoted to Other. This is the absolute gate
+                          against stroked-only artwork ending up on a
+                          target layer (Lights stripes, arrowheads,
+                          line-art, taxiway outline polygons, painted
+                          hold-position bars, centerline marks).
+                          Runways are the only exemption because
+                          grass-strip runways are drawn as stroked
+                          rectangles (F45 is the canonical case).
 
 Output: predictions JSON in the same format as predict_one.py — one
 record per polygon, with bbox in AI y-up coordinates so
@@ -97,8 +115,8 @@ RUNWAY_RE = re.compile(r"^(0?[1-9]|[12][0-9]|3[0-6])[LRC]?$")
 # yields a candidate. 1pt is effectively "directly on the centerline"; we
 # expand to 100pt before giving up on this end.
 CENTERLINE_WIDTHS_PT = (1.0, 10.0, 25.0, 50.0, 100.0)
-# Hull rejection (step 4): classes whose polygons are exempt from the
-# centroid-in-hull test. Rule-claimed and never re-tested. Labels in
+# Hull rejection (step 5): classes whose polygons are exempt from the
+# bbox-intersects-hull test. Rule-claimed and never re-tested. Labels in
 # particular can sit at chart edges (runway numbers past the threshold,
 # taxiway letters at the far end of a stub) so they must not be culled.
 HULL_EXEMPT_CLASSES = frozenset({
@@ -180,7 +198,7 @@ def _segment_intersects_bbox(p1, p2, x0, y0, x1, y1) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — centerline-token search and K-nearest claim
+# Step 3 — runway-label centerline-token search and K-nearest claim
 # ---------------------------------------------------------------------------
 
 def _match_runway_labels(runway_indices, all_polys, text_tokens,
@@ -350,7 +368,8 @@ def main():
     ap.add_argument("--nasr-rwy", type=Path,
                     default=Path(__file__).parent.parent / "data" / "nasr_apt_rwy.csv")
     ap.add_argument("--skip-hull", action="store_true",
-                    help="Experiment toggle: skip hull rejection (step 4) entirely.")
+                    help="Experiment toggle: skip hull rejection (step 5) entirely. "
+                         "Production default — set in classify.sh via PIPELINE_EXTRA.")
     ap.add_argument("--footprint-threshold", type=float, default=None,
                     help="If set, label as Footprints whenever P(Footprints) >= threshold "
                          "(overriding argmax). Lower = more sensitive. 0.5 ≈ argmax, "
@@ -480,7 +499,7 @@ def main():
         json.dumps(step3_diag, indent=2, default=str)
     )
 
-    # ---- Step 5 (was 6): concave-hull rejection BEFORE ML ------------
+    # ---- Step 5: concave-hull rejection (pre-ML) --------------------
     # Build a concave hull (no buffer) over the rule-claimed Runways +
     # Taxiways' anchor points. A non-exempt polygon is demoted only
     # when its bbox doesn't intersect the hull at all — anything that
@@ -574,7 +593,7 @@ def main():
     for lab, n in counts.items():
         print(f"    {lab:<22} {n}")
 
-    # ---- Step 7 (user-facing step 6): stroked-only sweep -------------
+    # ---- Step 7: stroked-only sweep ---------------------------------
     # Final pass: any polygon that's stroked-only (stroked && not filled)
     # AND not on the Runways layer is demoted to Other. Catches Lights,
     # arrowheads, line art, decorative symbols, and any stroked outline
