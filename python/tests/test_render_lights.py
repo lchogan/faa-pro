@@ -49,3 +49,18 @@ def test_emit_skips_unknown_key_and_emits_nothing_for_empty():
                          _artwork())
     layer = svg2.find("g")
     assert layer is not None and layer.find("g") is None  # layer, no symbols
+
+
+def test_approach_lights_layer_sits_below_pdf_text_tokens():
+    # Simulate main()'s ordering: PDF Text Tokens layer already exists (topmost)
+    # before approach lights are injected.
+    svg = ET.Element("svg")
+    ET.SubElement(svg, "g", {"id": "Runways"})
+    ET.SubElement(svg, "g", {"id": "PDF Text Tokens"})
+    emit_approach_lights(svg, [{
+        "artwork_key": "malsr", "x": 0.0, "y": 0.0,
+        "dir_x": 1.0, "dir_y": 0.0, "target_width": 50.0,
+    }], _artwork())
+    ids = [c.get("id") for c in list(svg)]
+    # Approach Lights must come BEFORE PDF Text Tokens (so tokens paint on top).
+    assert ids.index("Approach Lights") < ids.index("PDF Text Tokens")

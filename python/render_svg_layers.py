@@ -165,11 +165,23 @@ def emit_approach_lights(svg, light_groups, artwork):
             layer = child
             break
     if layer is None:
-        layer = ET.SubElement(svg, "g", {
+        layer = ET.Element("g", {
             "id": "Approach Lights",
             "inkscape:label": "Approach Lights",
             "inkscape:groupmode": "layer",
         })
+        # Keep Approach Lights just BELOW the PDF Text Tokens layer, which must
+        # stay topmost. SVG paints later children on top, so insert before the
+        # tokens layer if it exists; otherwise append.
+        tokens_index = None
+        for i, child in enumerate(list(svg)):
+            if child.get("id") == "PDF Text Tokens":
+                tokens_index = i
+                break
+        if tokens_index is None:
+            svg.append(layer)
+        else:
+            svg.insert(tokens_index, layer)
 
     native_width = artwork.native_width
     for lg in light_groups:
