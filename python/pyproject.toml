@@ -14,6 +14,12 @@ dependencies = [
     "shapely>=2.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "svgelements>=1.9",
+]
+
 [project.scripts]
 faa-train = "train:main"
 faa-predict = "predict:main"
