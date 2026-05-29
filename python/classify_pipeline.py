@@ -110,6 +110,8 @@ from pipeline.extract_pdf_text import (
 )
 from pipeline.hull_filter import hull_reject
 from pipeline.runway_detection import detect_runways
+from pipeline.approach_light_layout import compute_approach_light_placements
+from pipeline.approach_lights_data import load_approach_lights
 from pipeline.runway_label_layout import compute_runway_label_translations
 from pipeline.taxi_detection import match_taxi_labels
 
@@ -389,6 +391,12 @@ def main():
                     help="If set, label as Footprints whenever P(Footprints) >= threshold "
                          "(overriding argmax). Lower = more sensitive. 0.5 ≈ argmax, "
                          "try 0.3 or 0.2 to catch borderline buildings.")
+    ap.add_argument("--place-lights", action="store_true",
+                    help="Place approach-lighting symbols (step 8b). Requires "
+                         "--nasr-rwy-end and artwork/lights/lights.json.")
+    ap.add_argument("--nasr-rwy-end", type=Path,
+                    default=Path(__file__).parent.parent / "data" / "nasr_apt_rwy_end.csv",
+                    help="NASR runway-end CSV (per-end approach-light codes).")
     args = ap.parse_args()
 
     # NASR runway designations for THIS airport. Used by the runway-label
@@ -642,6 +650,25 @@ def main():
     args.out.with_suffix(".step3b.json").write_text(
         json.dumps(step3b_diag, indent=2, default=str)
     )
+
+    # Step 8b: approach-light placement. Lights may overlap pavement, so
+    # unlike runway labels there is NO collision-march — symbols sit at a
+    # fixed gap off the pavement end. Gated by --place-lights.
+    light_groups: list[dict] = []
+    if args.place_lights:
+        if not args.nasr_rwy_end or not args.nasr_rwy_end.exists():
+            raise SystemExit(
+                f"--place-lights requires runway-end data; not found: {args.nasr_rwy_end}"
+            )
+        als_by_end = load_approach_lights(args.nasr_rwy_end, airport_code)
+        light_groups, step8b_diag = compute_approach_light_placements(
+            all_polys, step3_diag, runway_indices, als_by_end,
+        )
+        args.out.with_suffix(".step8b.json").write_text(
+            json.dumps(step8b_diag, indent=2, default=str)
+        )
+        print(f"  Approach lights placed: {len(light_groups)}")
+
     n_moved = sum(
         1 for tx, ty in label_translations.values()
         if abs(tx) > 1e-6 or abs(ty) > 1e-6
@@ -785,6 +812,7 @@ def main():
         "predictions": records,
         "text_tokens": token_records,
         "label_groups": label_groups,
+        "light_groups": light_groups,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2))
