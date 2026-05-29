@@ -53,3 +53,102 @@ def _reciprocal_designation(desig: str) -> str | None:
             n -= 36
         return f"{n}{_LR_SWAP[m.group(2)]}"
     return _COMPASS_RECIP.get((desig or "").upper())
+
+
+def _document_width_reference(all_polys, runway_indices) -> float:
+    """Largest depicted half-width across all runways on the page. Behind one
+    function so it can be swapped for a median/percentile during tuning."""
+    max_half_wid = 0.0
+    for ri in runway_indices:
+        poly = all_polys[ri]
+        _, _, _, _, _, half_wid = _runway_extents(
+            poly.get("subpaths") or [], poly["rect"],
+        )
+        if half_wid > max_half_wid:
+            max_half_wid = half_wid
+    return max_half_wid
+
+
+def compute_approach_light_placements(
+    all_polys: list[dict],
+    step3_diag: list[dict],
+    runway_indices,
+    als_by_end: dict[str, str],
+    *,
+    k: float = DEFAULT_K,
+    g: float = DEFAULT_G,
+) -> tuple[list[dict], list[dict]]:
+    """Compute one light_group per runway end that has an in-scope ALS.
+
+    See module docstring for the output schema. `als_by_end` maps normalized
+    end designators to raw FAA codes (from approach_lights_data). `k`/`g` are
+    the size/gap tuning knobs.
+    """
+    light_groups: list[dict] = []
+    diagnostics: list[dict] = []
+
+    max_half_wid = _document_width_reference(all_polys, runway_indices)
+    if max_half_wid <= 0.0:
+        return light_groups, diagnostics
+    target_width = k * (2.0 * max_half_wid)
+    gap = g * target_width
+
+    # Group step3 entries by runway.
+    by_runway: dict[int, list[dict]] = {}
+    for d in step3_diag:
+        by_runway.setdefault(d["runway_idx"], []).append(d)
+
+    for ri in runway_indices:
+        ends = by_runway.get(ri, [])
+
+        # Designator per end_sign, from the matched runway-number token.
+        desig_by_sign: dict[int, str] = {}
+        for d in ends:
+            if d.get("matched") and d.get("token"):
+                nd = _normalize_designation(str(d["token"]))
+                if nd:
+                    desig_by_sign[int(d["end_sign"])] = nd
+        if not desig_by_sign:
+            diagnostics.append({"runway_idx": ri, "skipped": "no_matched_number"})
+            continue
+        # Reciprocal inference when only one end carried a number.
+        if len(desig_by_sign) == 1:
+            (known_sign, known_desig), = desig_by_sign.items()
+            recip = _reciprocal_designation(known_desig)
+            if recip:
+                desig_by_sign.setdefault(-known_sign, recip)
+
+        poly = all_polys[ri]
+        cx, cy, ux, uy, half_len, _ = _runway_extents(
+            poly.get("subpaths") or [], poly["rect"],
+        )
+        if not math.isfinite(half_len):
+            continue
+
+        for end_sign, desig in desig_by_sign.items():
+            code = als_by_end.get(desig)
+            key = als_code_to_artwork_key(code)
+            if key is None:
+                if code:
+                    diagnostics.append({
+                        "runway_idx": ri, "end_sign": end_sign,
+                        "designator": desig, "code": code, "skipped": "unmapped_code",
+                    })
+                continue
+            out_x, out_y = end_sign * ux, end_sign * uy
+            ax = cx + (half_len + gap) * out_x
+            ay = cy + (half_len + gap) * out_y
+            light_groups.append({
+                "artwork_key": key,
+                "x": round(ax, 4),
+                "y": round(ay, 4),
+                "dir_x": round(out_x, 6),
+                "dir_y": round(out_y, 6),
+                "target_width": round(target_width, 4),
+            })
+            diagnostics.append({
+                "runway_idx": ri, "end_sign": end_sign,
+                "designator": desig, "code": code, "artwork_key": key,
+            })
+
+    return light_groups, diagnostics
