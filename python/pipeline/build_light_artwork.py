@@ -2,21 +2,26 @@
 normalized artwork JSON the renderer consumes (artwork/lights/lights.json).
 
 Run after exporting artboards from Illustrator ("Export for Screens", one SVG
-per artboard, named by the artwork key). Flattens each SVG to absolute paths
-via svgelements, normalizes to the canonical frame (attach point = bottom-
-center -> origin; artboard "up" -> +X), asserts all artboards share one width
-(the runway-width reference that makes per-document uniform scaling valid),
-and writes lights.json.
+per artboard, named by the artwork key). Converts every drawable shape to a
+Path via svgelements, applies the canonical affine transform as a Matrix (so
+Bézier control points are transformed correctly, not dropped), handles SVG
+primitives (rect/circle/line/polygon) that Illustrator commonly emits, and
+writes lights.json.
 
 Dependencies:
     svgelements >= 1.9 (pip install svgelements)
 
 Key concepts:
     Canonical frame: attach point is the artboard bottom-center (W/2, H).
-    The canonical transform maps SVG coords to frame coords:
+    The canonical transform is the affine Matrix(0, 1, -1, 0, H, -W/2),
+    equivalent to the per-point formula:
         canonical (X, Y) = (H - py, px - W/2)
     So the attach point maps to (0, 0), and paths extending "up" (decreasing
     py) produce positive X values — the forward direction.
+
+    Applying the transform via Matrix (not per-endpoint arithmetic) preserves
+    Bézier control points, so curved shapes (flasher dots, rounded marks)
+    survive the normalization step unchanged.
 
     native_width = W is the shared artboard width used by the renderer to
     compute a uniform scale factor for each airport diagram.
@@ -30,17 +35,18 @@ import json
 import sys
 from pathlib import Path
 
-from svgelements import SVG, Path as SvgPath, Move
+from svgelements import SVG, Path as SvgPath, Shape, Matrix
 
 
 def _symbol_from_svg(svg_path: Path) -> tuple[float, list[dict]]:
-    """Parse one artboard SVG and return (artboard_width, paths).
+    """Return (artboard_width, paths) with every drawable shape converted to a
+    Path and mapped into the canonical frame (attach bottom-center -> origin,
+    "up" -> +X) via the affine Matrix(0, 1, -1, 0, H, -W/2).
 
-    Each path in the return list is normalized to the canonical frame where
-    the artboard bottom-center is the origin and "up" is the +X direction.
-
-    The canonical transform per point is:
-        (X, Y) = (H - py, px - W/2)
+    Using Matrix multiplication rather than per-point arithmetic ensures Bézier
+    control points are transformed correctly (curves preserved, not flattened).
+    Filtering on Shape (not SvgPath) ensures SVG primitives emitted by
+    Illustrator (rect, circle, line, polygon) are included rather than dropped.
 
     Args:
         svg_path: Absolute path to the artboard SVG file.
@@ -48,52 +54,35 @@ def _symbol_from_svg(svg_path: Path) -> tuple[float, list[dict]]:
     Returns:
         A 2-tuple (W, paths) where W is the artboard width (float) and paths
         is a list of dicts with keys: d, fill, stroke, stroke_width.
-
-    Raises:
-        ValueError: If the SVG contains no parseable path elements.
     """
     svg = SVG.parse(str(svg_path))
     W = float(svg.width)
     H = float(svg.height)
+    # Affine map verified: (50,120)->(0,0) and (50,20)->(100,0) for W=100,H=120.
+    to_canonical = Matrix(0, 1, -1, 0, H, -W / 2.0)
     paths: list[dict] = []
 
     for el in svg.elements():
-        if not isinstance(el, SvgPath):
+        # Drawable shapes only — excludes the SVG root and any group containers.
+        # Shape is the common base of Path/Rect/Circle/Ellipse/SimpleLine/
+        # Polyline/Polygon; SVG itself also inherits Shape so exclude it.
+        if not isinstance(el, Shape) or isinstance(el, SVG):
             continue
 
-        # Collect all subpaths and apply the canonical transform.
-        # We build the d string manually (not via SvgPath.d()) so we control
-        # the format: no spaces after M/L commands, which lets the test assert
-        # d.startswith("M0") cleanly.
-        parts: list[str] = []
-        for sub in el.as_subpaths():
-            segs = list(sub)
-            if not segs:
-                continue
-
-            # First segment is always a Move; its .end is the subpath start.
-            start_seg = segs[0]
-            assert isinstance(start_seg, Move), (
-                f"Expected Move as first subpath segment, got {type(start_seg)}"
-            )
-            allpts = [start_seg.end] + [s.end for s in segs[1:]]
-
-            canon_pts = [(H - pt.y, pt.x - W / 2.0) for pt in allpts]
-            first_X, first_Y = canon_pts[0]
-            parts.append(f"M{first_X},{first_Y}")
-            for X, Y in canon_pts[1:]:
-                parts.append(f" L{X},{Y}")
-
-        if not parts:
+        # abs() resolves the element's own transform and converts to absolute
+        # coordinates; * to_canonical applies the canonical affine map.
+        # Both operations work on the full segment sequence (including control
+        # points), so Bézier curves are preserved correctly.
+        path = abs(SvgPath(el)) * to_canonical
+        d = path.d()
+        if not d.strip():
             continue
 
-        d = "".join(parts)
-
-        # Resolve fill / stroke to strings; Color.value is None for "none".
+        # Resolve fill / stroke to hex strings; Color.value is None for "none".
         stroke = el.stroke
         fill = el.fill
-        stroke_str = str(stroke.hex) if stroke and stroke.value is not None else "none"
-        fill_str = str(fill.hex) if fill and fill.value is not None else "none"
+        fill_str = fill.hex if fill is not None and fill.value is not None else "none"
+        stroke_str = stroke.hex if stroke is not None and stroke.value is not None else "none"
         stroke_width = float(el.stroke_width) if el.stroke_width is not None else 0.0
 
         paths.append({
