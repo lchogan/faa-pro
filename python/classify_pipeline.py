@@ -657,17 +657,20 @@ def main():
     light_groups: list[dict] = []
     if args.place_lights:
         if not args.nasr_rwy_end or not args.nasr_rwy_end.exists():
-            raise SystemExit(
-                f"--place-lights requires runway-end data; not found: {args.nasr_rwy_end}"
+            # Warn and skip rather than abort: classify-airports.sh runs a
+            # batch under `set -e`, so a hard exit here would kill the whole
+            # run. Mirrors the renderer's warn-and-continue on missing artwork.
+            print(f"  WARN: --place-lights set but runway-end data not found "
+                  f"({args.nasr_rwy_end}); skipping approach lights")
+        else:
+            als_by_end = load_approach_lights(args.nasr_rwy_end, airport_code)
+            light_groups, step8b_diag = compute_approach_light_placements(
+                all_polys, step3_diag, runway_indices, als_by_end,
             )
-        als_by_end = load_approach_lights(args.nasr_rwy_end, airport_code)
-        light_groups, step8b_diag = compute_approach_light_placements(
-            all_polys, step3_diag, runway_indices, als_by_end,
-        )
-        args.out.with_suffix(".step8b.json").write_text(
-            json.dumps(step8b_diag, indent=2, default=str)
-        )
-        print(f"  Approach lights placed: {len(light_groups)}")
+            args.out.with_suffix(".step8b.json").write_text(
+                json.dumps(step8b_diag, indent=2, default=str)
+            )
+            print(f"  Approach lights placed: {len(light_groups)}")
 
     n_moved = sum(
         1 for tx, ty in label_translations.values()
