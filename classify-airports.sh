@@ -107,6 +107,12 @@ case "$confirm_lc" in
     y|yes) ;;
     *) echo "Aborted."; exit 0 ;;
 esac
+
+read -e -p "Place approach lights? [y/N] " place_lights_in
+case "$(echo "$place_lights_in" | tr '[:upper:]' '[:lower:]')" in
+    y|yes) export PLACE_LIGHTS=1 ;;
+    *)     export PLACE_LIGHTS=0 ;;
+esac
 echo
 
 for code in "${CODES[@]}"; do

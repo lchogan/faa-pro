@@ -50,6 +50,12 @@ export PYTHONPATH="$PROJECT/python${PYTHONPATH:+:$PYTHONPATH}"
 # Default disables hull rejection (see header comment for rationale).
 PIPELINE_EXTRA="${PIPELINE_EXTRA:---skip-hull}"
 
+# Optional: place approach-lighting symbols (step 8b). Enable by exporting
+# PLACE_LIGHTS=1 (classify-airports.sh sets this from an interactive prompt).
+if [[ "${PLACE_LIGHTS:-0}" == "1" ]]; then
+    PIPELINE_EXTRA="${PIPELINE_EXTRA:-} --place-lights"
+fi
+
 # Single-airport invocations get auto-opened in Illustrator. Batch
 # invocations (>1 arg) skip the open step to avoid a window per airport.
 # Set OPEN_AFTER_CLASSIFY=0 to disable, OPEN_AFTER_CLASSIFY=1 to force on.
