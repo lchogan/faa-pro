@@ -346,6 +346,16 @@ def _match_runway_labels(runway_indices, all_polys, text_tokens,
             label_indices.update(nearest)
             diag["matched"] = True
             diag["token"] = tok["text"]
+            # Plumb the matched token's full text-stream metadata
+            # through so step 8 (label move) and the renderer's
+            # text-layer pass can recover rotation, font size, and
+            # the original on-page position without re-walking
+            # text_tokens.
+            diag["token_cx"] = float(tok["cx"])
+            diag["token_cy"] = float(tok["cy"])
+            diag["token_dir"] = tuple(tok.get("dir", (1.0, 0.0)))
+            diag["token_font_size"] = float(tok.get("font_size", 0.0))
+            diag["token_font_name"] = str(tok.get("font_name", ""))
             diag["width"] = width
             diag["lat"] = lat
             diag["dist_past_end"] = dist_past
@@ -437,7 +447,7 @@ def main():
     # Tokens consumed by step 3 are excluded — each PDF text token
     # identifies polygons at most once across the pipeline.
     print(f"[pipeline] step 4: taxi-label K-nearest claim")
-    taxi_label_list = match_taxi_labels(
+    taxi_label_list, taxi_label_groups = match_taxi_labels(
         all_polys, taxi_surfaces, text_tokens,
         claimed_polys=claimed,
         excluded_token_ids=step3_used_token_ids,
@@ -677,6 +687,96 @@ def main():
         "y":    round(page_h - t["cy"], 4),  # PDF y-down -> AI y-up
     } for t in text_tokens]
 
+    # Label groups for the text-replacement pass. One record per
+    # claimed runway-label or taxi-label group, carrying the inputs
+    # an SVG <text> element needs:
+    #   text       — token string (e.g. "17R", "B1")
+    #   x, y       — placement center in AI y-up coords. Computed
+    #                from the AABB of the *painted glyph polygons*
+    #                (with step-8 translation applied for runway
+    #                labels), NOT from the PDF text stream's word
+    #                bbox. The text stream is the invisible-search
+    #                layer; its bbox can sit a few points off from
+    #                the visible artwork. AABB-of-polygons gives us
+    #                the actual visual center of the painted glyphs
+    #                so the rendered text overlays them precisely.
+    #   dir_x, dir_y — writing direction unit vector from the PDF
+    #                text stream (`line.dir`). Verified empirically
+    #                to match the painted glyph rotation.
+    #   font_size  — PDF font size in points. Carried per-group for
+    #                debugging; the renderer overrides with the
+    #                per-class median so all labels in a class
+    #                render at the same size (FAA charts use a
+    #                consistent label size, but the PDF text stream
+    #                quantizes it inconsistently across tokens).
+    #   class      — "Runway Labels" or "Taxiway Labels" so the
+    #                renderer can put each on the right layer.
+    def _group_aabb_center(claimed_indices, dx_shift=0.0, dy_shift=0.0):
+        """AABB of the listed polygons' rects (with optional rigid
+        shift), returned as the centroid of that bbox in PDF coords."""
+        xs0, ys0, xs1, ys1 = [], [], [], []
+        for idx in claimed_indices:
+            r = all_polys[idx]["rect"]
+            xs0.append(r[0] + dx_shift)
+            ys0.append(r[1] + dy_shift)
+            xs1.append(r[2] + dx_shift)
+            ys1.append(r[3] + dy_shift)
+        if not xs0:
+            return None
+        return (
+            (min(xs0) + max(xs1)) / 2.0,
+            (min(ys0) + max(ys1)) / 2.0,
+        )
+
+    label_groups: list[dict] = []
+    for diag in step3_diag:
+        if not diag.get("matched"):
+            continue
+        if not diag.get("claimed"):
+            continue
+        claimed_idx = diag["claimed"]
+        # Runway label group rides step 8's translation rigidly —
+        # every glyph in the group has the same (tx, ty) so reading
+        # the first one's translation is exact.
+        tx, ty = label_translations.get(claimed_idx[0], (0.0, 0.0))
+        center = _group_aabb_center(claimed_idx, tx, ty)
+        if center is None:
+            continue
+        cx_pdf, cy_pdf = center
+        dx_dir, dy_dir = diag.get("token_dir", (1.0, 0.0))
+        # dir is stored in PDF y-down coords (the convention SVG also
+        # uses by default). Position is in AI y-up because that's the
+        # downstream convention; the renderer flips position back to
+        # y-down at emit time. Direction does NOT need to flip because
+        # SVG matrices are y-down — flipping dir would mirror-rotate
+        # every non-horizontal label.
+        label_groups.append({
+            "class": "Runway Labels",
+            "text": str(diag["token"]),
+            "x": round(cx_pdf, 4),
+            "y": round(page_h - cy_pdf, 4),  # PDF y-down -> AI y-up
+            "dir_x": round(float(dx_dir), 6),
+            "dir_y": round(float(dy_dir), 6),
+            "font_size": round(float(diag.get("token_font_size", 0.0)), 4),
+            "font_name": str(diag.get("token_font_name", "")),
+        })
+    for grp in taxi_label_groups:
+        center = _group_aabb_center(grp.get("claimed") or [])
+        if center is None:
+            continue
+        cx_pdf, cy_pdf = center
+        dx_dir, dy_dir = grp.get("dir", (1.0, 0.0))
+        label_groups.append({
+            "class": "Taxiway Labels",
+            "text": str(grp["text"]),
+            "x": round(cx_pdf, 4),
+            "y": round(page_h - cy_pdf, 4),
+            "dir_x": round(float(dx_dir), 6),
+            "dir_y": round(float(dy_dir), 6),
+            "font_size": round(float(grp.get("font_size", 0.0)), 4),
+            "font_name": str(grp.get("font_name", "")),
+        })
+
     payload = {
         "airport": records[0]["airport"] if records else None,
         "model_labels": list(LABELS),
@@ -684,6 +784,7 @@ def main():
         "confidence_threshold": None,
         "predictions": records,
         "text_tokens": token_records,
+        "label_groups": label_groups,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2))

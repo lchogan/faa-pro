@@ -98,7 +98,8 @@ def match_taxi_labels(all_polys: list[dict],
                       taxi_surfaces: list[dict],
                       text_tokens: list[dict],
                       claimed_polys: set[int] | None = None,
-                      excluded_token_ids: set[int] | None = None) -> list[int]:
+                      excluded_token_ids: set[int] | None = None
+                      ) -> tuple[list[int], list[dict]]:
     """For each token matching the taxi-label regex whose bbox touches
     a taxi-surface polygon, claim the K = len(token.text) nearest
     near-black filled polygons (excluding ones already in
@@ -115,7 +116,16 @@ def match_taxi_labels(all_polys: list[dict],
     taxi surface would re-qualify here and pull arrowheads or other
     near-black symbols into Taxiway Labels via the K-nearest claim.
 
-    Returns the list of claimed indices in claim order.
+    Returns:
+      (label_indices, groups)
+        label_indices:  flat list of claimed polygon indices in claim
+                        order (back-compat with prior callers).
+        groups:         list of per-token claim dicts with the matched
+                        token's full text-stream metadata
+                        (text, cx, cy, dir, font_size, font_name) and
+                        the polygon indices claimed for that token.
+                        Consumed by the label-text-replacement layer
+                        in render_svg_layers.
     """
     claimed: set[int] = set(claimed_polys or [])
     excluded_ids: set[int] = set(excluded_token_ids or [])
@@ -129,6 +139,7 @@ def match_taxi_labels(all_polys: list[dict],
         return p["filled"] and p["is_near_black"] and not p["is_taxi_surface"]
 
     label_indices: list[int] = []
+    groups: list[dict] = []
     for tok in qualifying:
         k = len(tok["text"])
         scored = []
@@ -139,10 +150,22 @@ def match_taxi_labels(all_polys: list[dict],
             dy = tok["cy"] - p["cy"]
             scored.append((dx * dx + dy * dy, i))
         scored.sort()
-        for _, i in scored[:k]:
+        nearest = [i for _, i in scored[:k]]
+        if not nearest:
+            continue
+        for i in nearest:
             claimed.add(i)
             label_indices.append(i)
-    return label_indices
+        groups.append({
+            "text": tok["text"],
+            "cx": float(tok["cx"]),
+            "cy": float(tok["cy"]),
+            "dir": tuple(tok.get("dir", (1.0, 0.0))),
+            "font_size": float(tok.get("font_size", 0.0)),
+            "font_name": str(tok.get("font_name", "")),
+            "claimed": list(nearest),
+        })
+    return label_indices, groups
 
 
 def _runway_extents(subpaths: list[list[tuple[float, float]]],
@@ -213,7 +236,7 @@ def detect_taxi(pdf_path: Path) -> dict:
                             if p["is_taxi_surface"]]
     taxi_surfaces = [all_polys[i] for i in taxi_surface_indices]
 
-    label_indices = match_taxi_labels(
+    label_indices, _ = match_taxi_labels(
         all_polys, taxi_surfaces, text_tokens,
         claimed_polys=set(taxi_surface_indices),
     )

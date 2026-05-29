@@ -33,6 +33,8 @@ from pipeline.extract_paths_fitz import (
 
 TARGET_LAYERS = [
     "PDF Text Tokens",
+    "Runway Labels (Text)",
+    "Taxiway Labels (Text)",
     "Footprints",
     "Runways",
     "Runway Labels",
@@ -45,6 +47,27 @@ TARGET_LAYERS = [
 
 TOKEN_FONT_SIZE = 4.0
 TOKEN_COLOR_HEX = "#cc00cc"
+
+# Font fallback for the label-text layers. FAA charts use a chart-
+# specific font that won't be available outside the chart-publishing
+# pipeline; Helvetica Bold / Arial Bold are the closest mainstream
+# substitutes. The `<text>` rendered glyphs come out ~95% visually
+# identical — same rotation + size + position, slight differences in
+# character widths and stroke weight.
+LABEL_FONT_FAMILY = "Helvetica Bold, Arial Bold, sans-serif"
+LABEL_TEXT_COLOR = "#000000"
+
+# Vertical-centering offset for label text. SVG's dominant-baseline
+# attribute is unreliable across SVG importers (Illustrator in
+# particular renders most label text with the alphabetic baseline
+# regardless of the value). With alphabetic baseline anchored at the
+# polygon AABB center, uppercase / digit glyphs (which is what every
+# FAA label uses) sit ~cap-height/2 above the anchor. We shift the
+# text element's local y by this fraction of font-size so the visual
+# center lands on the anchor — equivalent to a rotation-aware "down
+# by 0.36 em" offset, since y is in the text's local frame and the
+# matrix transform takes care of orientation.
+LABEL_VCENTER_OFFSET = 0.36
 
 
 def _color_hex(raw):
@@ -126,6 +149,7 @@ def main():
     payload = json.loads(args.predictions.read_text())
     preds = payload.get("predictions", [])
     text_tokens = payload.get("text_tokens", [])
+    label_groups = payload.get("label_groups", [])
 
     src = fitz.open(args.pdf)
     src_page = src[0]
@@ -195,11 +219,45 @@ def main():
     }
     svg = ET.Element("svg", svg_attrs)
 
+    # Sort label_groups by class so the renderer can emit them onto
+    # the right `<g>` layer below.
+    runway_text_groups = [g for g in label_groups if g.get("class") == "Runway Labels"]
+    taxi_text_groups = [g for g in label_groups if g.get("class") == "Taxiway Labels"]
+
+    # Uniform per-class font size. FAA charts use one consistent size
+    # for runway labels and one for taxi labels, but the PDF text
+    # stream quantizes the size slightly differently per token (saw
+    # 4.97-5.99 across COS taxi labels, 5.85-6.67 across runway labels).
+    # Median of the per-token sizes gives one stable value per class
+    # that every label in that class renders at, matching the chart's
+    # design intent.
+    def _median(xs):
+        xs = sorted(x for x in xs if x > 0.0)
+        n = len(xs)
+        if n == 0:
+            return 0.0
+        if n % 2:
+            return xs[n // 2]
+        return 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+
+    runway_font_size = _median(g.get("font_size", 0.0) for g in runway_text_groups)
+    taxi_font_size = _median(g.get("font_size", 0.0) for g in taxi_text_groups)
+    class_font_size = {
+        "Runway Labels": runway_font_size,
+        "Taxiway Labels": taxi_font_size,
+    }
+
     # Layer order in SVG: first child = bottom of stack visually. To
     # match TARGET_LAYERS' top-to-bottom intent, emit in reverse order.
+    text_layer_groups = {
+        "Runway Labels (Text)": (runway_text_groups, "Runway Labels"),
+        "Taxiway Labels (Text)": (taxi_text_groups, "Taxiway Labels"),
+    }
     for name in reversed(TARGET_LAYERS):
         bucket = layer_buckets.get(name, [])
-        if not bucket and name not in ("Metadata", "PDF Text Tokens"):
+        text_entry = text_layer_groups.get(name)
+        always_emit = name in ("Metadata", "PDF Text Tokens")
+        if not bucket and not text_entry and not always_emit:
             continue
         g = ET.SubElement(svg, "g", {
             "id": name,
@@ -207,6 +265,63 @@ def main():
             "inkscape:groupmode": "layer",
         })
         if name == "PDF Text Tokens":
+            continue
+        if text_entry is not None:
+            # Text-replacement layer: emit one <text> per label group.
+            # Every group in the layer renders at the per-class
+            # median font size — chart designers use one size per
+            # label class, but the PDF text stream quantizes that
+            # size unevenly per token. Single shared size = uniform
+            # appearance.
+            text_bucket, class_name = text_entry
+            size = class_font_size.get(class_name, 0.0)
+            if size <= 0.0:
+                # Class has no usable font size (no qualifying tokens
+                # carried one). Skip rendering rather than emit at a
+                # guessed scale.
+                continue
+            g.set("font-family", LABEL_FONT_FAMILY)
+            g.set("fill", LABEL_TEXT_COLOR)
+            g.set("text-anchor", "middle")
+            g.set("font-size", f"{size:.3f}")
+            # Pre-compute the local-frame baseline offset for this
+            # class. Same value for every label in the layer because
+            # font-size is uniform per class.
+            y_local = LABEL_VCENTER_OFFSET * size
+            for grp in text_bucket:
+                text = str(grp.get("text", ""))
+                if not text:
+                    continue
+                x_ai = float(grp.get("x", 0.0))
+                y_ai = float(grp.get("y", 0.0))
+                dx_dir = float(grp.get("dir_x", 1.0))
+                dy_dir = float(grp.get("dir_y", 0.0))
+                # SVG rotation matrix. The matrix
+                # `(dx, dy, -dy, dx, e, f)` maps local (x, y) →
+                # global (dx*x − dy*y + e, dy*x + dx*y + f). It
+                # rotates by atan2(dy, dx) around (e, f) — text
+                # reads along (dx, dy) starting at the anchor. dir
+                # is already in PDF y-down (= SVG y-down) so it
+                # plugs directly into the matrix.
+                x_svg = x_ai
+                y_svg = page_h - y_ai
+                transform = (
+                    f"matrix({dx_dir:.6f},{dy_dir:.6f},"
+                    f"{-dy_dir:.6f},{dx_dir:.6f},"
+                    f"{x_svg:.4f},{y_svg:.4f})"
+                )
+                # text-anchor=middle horizontally centers the
+                # glyphs at local x=0. y=cap-height/2 puts the
+                # alphabetic baseline below the anchor by half the
+                # cap height, which makes the visual center of
+                # uppercase / digit glyphs land exactly at the
+                # anchor — independent of orientation, since y is
+                # in the text's local (post-rotation) frame.
+                te = ET.SubElement(g, "text", {
+                    "transform": transform,
+                    "y": f"{y_local:.4f}",
+                })
+                te.text = text
             continue
         for p in bucket:
             attrs = {"d": p["d"], "fill": p["fill"] or "none"}

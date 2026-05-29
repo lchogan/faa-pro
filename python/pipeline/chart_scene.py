@@ -18,7 +18,13 @@ Returns a dict with:
                      (the clip path's items). Used by runway_detection
                      so grass-strip outlines stored as nested clip
                      groups (e.g. F45) become visible candidates.
-    text_tokens    — page word tokens with bbox + center.
+    text_tokens    — page word tokens with bbox + center, plus the
+                     per-token writing direction (`dir`), font size,
+                     and font name pulled from `page.get_text("dict")`.
+                     Used by the label-text-replacement pass in
+                     render_svg_layers to emit `<text>` elements that
+                     overlay the painted glyph polygons at the right
+                     orientation and size.
     page_w, page_h — page dimensions in PDF points.
 """
 
@@ -151,19 +157,65 @@ def read_chart(pdf_path: Path) -> dict:
             "subpaths": subpaths,
         })
 
-    # Page word tokens.
+    # Page word tokens. We pull word-level granularity from
+    # `get_text("words")` (one row per whitespace-bounded chunk, with
+    # per-word AABB) and then attach per-token rotation + font size by
+    # matching each word back to the span it came from in
+    # `get_text("dict")`. The dict format carries `dir` per LINE and
+    # `size` / `font` per SPAN — both reliable on FAA charts and the
+    # canonical source for label rotation, since the painted glyph
+    # polygons match the text-stream `dir` (verified empirically on
+    # COS: taxi labels like B3, C2, E5 each carry their own per-token
+    # dir matching the visible artwork).
+    dict_data = page.get_text("dict")
+    span_meta: list[dict] = []
+    for blk in dict_data.get("blocks", []):
+        for line in blk.get("lines", []):
+            ldir = line.get("dir") or (1.0, 0.0)
+            for span in line.get("spans", []):
+                bb = span.get("bbox")
+                if not bb:
+                    continue
+                span_meta.append({
+                    "bbox": bb,
+                    "dir": (float(ldir[0]), float(ldir[1])),
+                    "size": float(span.get("size", 0.0)),
+                    "font": str(span.get("font", "")),
+                })
+
+    def _lookup_span(cx: float, cy: float):
+        # Smallest containing span wins — rotated text spans can
+        # overlap horizontally-laid neighbours, and the tighter bbox
+        # is the actual owning span for that word.
+        candidates = []
+        for sm in span_meta:
+            sx0, sy0, sx1, sy1 = sm["bbox"]
+            if sx0 - 0.5 <= cx <= sx1 + 0.5 and sy0 - 0.5 <= cy <= sy1 + 0.5:
+                area = max(1e-6, (sx1 - sx0) * (sy1 - sy0))
+                candidates.append((area, sm))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+
     words = page.get_text("words")
     text_tokens: list[dict] = []
     for w in words:
         x0, y0, x1, y1, txt, *_ = w
         if not txt or not txt.strip():
             continue
+        cx = (float(x0) + float(x1)) / 2.0
+        cy = (float(y0) + float(y1)) / 2.0
+        sm = _lookup_span(cx, cy)
         text_tokens.append({
             "text": txt,
             "x0": float(x0), "y0": float(y0),
             "x1": float(x1), "y1": float(y1),
-            "cx": (float(x0) + float(x1)) / 2.0,
-            "cy": (float(y0) + float(y1)) / 2.0,
+            "cx": cx,
+            "cy": cy,
+            "dir": sm["dir"] if sm else (1.0, 0.0),
+            "font_size": sm["size"] if sm else 0.0,
+            "font_name": sm["font"] if sm else "",
         })
     doc.close()
 
