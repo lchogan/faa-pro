@@ -33,6 +33,7 @@ from pipeline.extract_paths_fitz import (
 
 TARGET_LAYERS = [
     "PDF Text Tokens",
+    "Approach Lights",
     "Runway Labels (Text)",
     "Taxiway Labels (Text)",
     "Footprints",
@@ -139,6 +140,62 @@ def _items_to_svg_d(items) -> str:
     return " ".join(parts)
 
 
+def emit_approach_lights(svg, light_groups, artwork):
+    """Inject approach-light symbols into a (new or existing) "Approach Lights"
+    SVG layer <g>. Each light is one <g> with a scale+rotate+translate matrix
+    wrapping the symbol's <path>s.
+
+    light_groups entries are {artwork_key, x, y, dir_x, dir_y, target_width} in
+    PyMuPDF top-left (y-down) coords — applied directly, no flip (matching the
+    per-polygon translate convention, NOT the y-flipped text-label convention).
+    Does nothing when light_groups is empty.
+
+    Args:
+        svg: The root SVG Element to append the layer to.
+        light_groups: List of dicts with keys artwork_key, x, y, dir_x, dir_y,
+            target_width.
+        artwork: A LightArtwork instance providing native_width and symbols.
+    """
+    if not light_groups:
+        return
+    # Find or create the layer (same pattern as the PDF Text Tokens layer).
+    layer = None
+    for child in svg:
+        if child.get("id") == "Approach Lights":
+            layer = child
+            break
+    if layer is None:
+        layer = ET.SubElement(svg, "g", {
+            "id": "Approach Lights",
+            "inkscape:label": "Approach Lights",
+            "inkscape:groupmode": "layer",
+        })
+
+    native_width = artwork.native_width
+    for lg in light_groups:
+        sym = artwork.symbols.get(lg["artwork_key"])
+        if not sym:
+            continue
+        s = float(lg["target_width"]) / native_width
+        dx = float(lg["dir_x"])
+        dy = float(lg["dir_y"])
+        x = float(lg["x"])
+        y = float(lg["y"])
+        transform = (
+            f"matrix({s * dx:.6f},{s * dy:.6f},"
+            f"{-s * dy:.6f},{s * dx:.6f},"
+            f"{x:.4f},{y:.4f})"
+        )
+        g = ET.SubElement(layer, "g", {"transform": transform})
+        for p in sym.get("paths", []):
+            attrs = {"d": p["d"], "fill": p.get("fill") or "none"}
+            stroke = p.get("stroke")
+            if stroke and stroke != "none":
+                attrs["stroke"] = stroke
+                attrs["stroke-width"] = f"{float(p.get('stroke_width', 0.0)):.3f}"
+            ET.SubElement(g, "path", attrs)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pdf", type=Path, required=True)
@@ -150,6 +207,7 @@ def main():
     preds = payload.get("predictions", [])
     text_tokens = payload.get("text_tokens", [])
     label_groups = payload.get("label_groups", [])
+    light_groups = payload.get("light_groups", [])
 
     src = fitz.open(args.pdf)
     src_page = src[0]
@@ -332,6 +390,17 @@ def main():
             if abs(tx) > 1e-6 or abs(ty) > 1e-6:
                 attrs["transform"] = f"translate({tx:.4f},{ty:.4f})"
             ET.SubElement(g, "path", attrs)
+
+    # Inject approach-light artwork (new geometry, not from the PDF) into the
+    # "Approach Lights" layer. Placed before PDF Text Tokens so tokens stay
+    # topmost. No-op when there are no lights or no artwork library.
+    if light_groups:
+        from pipeline.light_artwork import load_light_artwork
+        lights_json = Path(__file__).parent.parent / "artwork" / "lights" / "lights.json"
+        if lights_json.exists():
+            emit_approach_lights(svg, light_groups, load_light_artwork(lights_json))
+        else:
+            print(f"  WARN: light_groups present but {lights_json} missing")
 
     # Add the PDF Text Tokens layer last so it ends up topmost.
     if text_tokens:
