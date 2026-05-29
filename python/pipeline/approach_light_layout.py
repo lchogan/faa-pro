@@ -129,7 +129,10 @@ def compute_approach_light_placements(
             code = als_by_end.get(desig)
             key = als_code_to_artwork_key(code)
             if key is None:
-                if code:
+                # Log only genuinely-unrecognized codes so new/edge FAA codes
+                # surface. "NONE" is the explicit no-approach-lights sentinel
+                # (most runway ends) — not an error, so don't flag it.
+                if code and code.strip().upper() != "NONE":
                     diagnostics.append({
                         "runway_idx": ri, "end_sign": end_sign,
                         "designator": desig, "code": code, "skipped": "unmapped_code",

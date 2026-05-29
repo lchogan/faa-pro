@@ -101,10 +101,16 @@ def test_none_and_unmapped_codes_emit_no_symbol():
     polys = [_rect_runway(500.0, 300.0, 400.0, 40.0)]
     step3 = [_diag(0, +1, "16"), _diag(0, -1, "34")]
     als = {"16": "NONE", "34": "NSTD"}   # one NONE, one out-of-scope
-    groups, _ = compute_approach_light_placements(
+    groups, diags = compute_approach_light_placements(
         polys, step3, runway_indices=[0], als_by_end=als,
     )
     assert groups == []
+    # NSTD is genuinely unrecognized -> flagged so new codes surface.
+    assert any(d.get("skipped") == "unmapped_code" and d.get("code") == "NSTD"
+               for d in diags)
+    # NONE is the explicit no-lights sentinel -> must NOT be flagged as unmapped.
+    assert not any(d.get("code") == "NONE" and d.get("skipped") == "unmapped_code"
+                   for d in diags)
 
 
 def test_runway_with_no_matched_number_is_skipped():
