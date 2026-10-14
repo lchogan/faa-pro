@@ -18,11 +18,17 @@ from __future__ import annotations
 
 import csv
 import io
+import re
+import subprocess
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ── FAA endpoints ─────────────────────────────────────────────────────────
 BASE_PDF_URL = "https://aeronav.faa.gov/d-tpp/{cycle}/{pdf_name}"
@@ -174,3 +180,124 @@ def write_runway_csv(rows: list[dict], dest: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def make_session(timeout: int = 60) -> requests.Session:
+    """Return a requests.Session with retry/backoff and a browser-like UA."""
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=1.5,
+                  status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {"User-Agent": "Mozilla/5.0 (compatible; FAA-Airport-Fetch/1.0)"}
+    )
+    return session
+
+
+def fetch_metafile(cycle: str, session: requests.Session) -> ET.Element:
+    """Fetch and parse the d-TPP metafile for the given cycle."""
+    resp = session.get(METAFILE_URL.format(cycle=cycle), timeout=90)
+    resp.raise_for_status()
+    return ET.fromstring(resp.content)
+
+
+def _parse_apt_base_csv(zf: zipfile.ZipFile, filename: str = "APT_BASE.csv") -> dict[str, dict]:
+    """Parse APT_BASE.csv -> {ARPT_ID: row} for US airports."""
+    airports: dict[str, dict] = {}
+    with zf.open(filename) as f:
+        reader = csv.DictReader(io.TextIOWrapper(f, encoding="latin-1"))
+        for row in reader:
+            apt_id = row.get("ARPT_ID", "").strip()
+            if apt_id and row.get("COUNTRY_CODE", "US").strip() == "US":
+                airports[apt_id] = dict(row)
+    return airports
+
+
+def _merge_airspace_class(airports: dict[str, dict], zf: zipfile.ZipFile,
+                          filename: str = "CLS_ARSP.csv") -> None:
+    """Inject '_AIRSPACE_CLASS' (B/C/D/E or None) into each airport row."""
+    priority = ["CLASS_B_AIRSPACE", "CLASS_C_AIRSPACE", "CLASS_D_AIRSPACE", "CLASS_E_AIRSPACE"]
+    letter = {"CLASS_B_AIRSPACE": "B", "CLASS_C_AIRSPACE": "C",
+              "CLASS_D_AIRSPACE": "D", "CLASS_E_AIRSPACE": "E"}
+    with zf.open(filename) as f:
+        reader = csv.DictReader(io.TextIOWrapper(f, encoding="latin-1"))
+        for row in reader:
+            apt_id = row.get("ARPT_ID", "").strip()
+            if apt_id not in airports:
+                continue
+            assigned = None
+            for col in priority:
+                if row.get(col, "").strip().upper() == "Y":
+                    assigned = letter[col]
+                    break
+            airports[apt_id]["_AIRSPACE_CLASS"] = assigned
+
+
+def download_nasr(date_str: str, session: requests.Session,
+                  lid: str | None = None, timeout: int = 300) -> tuple[dict[str, dict], list[dict]]:
+    """Download the 28-day NASR zip; return (airports, runway_rows).
+
+    airports: {ARPT_ID: row} with '_AIRSPACE_CLASS' merged in.
+    runway_rows: this airport's APT_RWY.csv rows when `lid` is given, else [].
+    Handles the nested CSV_Data/<date>_CSV.zip layout; falls back to a
+    flat APT_BASE.csv in the outer zip. Runway rows are only available
+    from the inner CSV zip.
+    """
+    resp = session.get(NASR_URL.format(date=date_str), timeout=timeout)
+    resp.raise_for_status()
+    runway_rows: list[dict] = []
+
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as outer_zf:
+        inner_names = [n for n in outer_zf.namelist()
+                       if re.search(r"CSV_Data/.*CSV\.zip$", n, re.I)]
+        if inner_names:
+            with outer_zf.open(inner_names[0]) as inner_raw:
+                inner_bytes = io.BytesIO(inner_raw.read())
+            with zipfile.ZipFile(inner_bytes) as inner_zf:
+                airports = _parse_apt_base_csv(inner_zf)
+                _merge_airspace_class(airports, inner_zf)
+                if lid:
+                    runway_rows = extract_runway_rows(inner_zf, lid)
+            return airports, runway_rows
+
+        base_csv = [n for n in outer_zf.namelist() if re.search(r"APT_BASE\.csv$", n, re.I)]
+        if base_csv:
+            airports = _parse_apt_base_csv(outer_zf, filename=base_csv[0])
+            cls_csv = [n for n in outer_zf.namelist() if re.search(r"CLS_ARSP\.csv$", n, re.I)]
+            if cls_csv:
+                _merge_airspace_class(airports, outer_zf, filename=cls_csv[0])
+            return airports, runway_rows
+
+    return {}, runway_rows
+
+
+def determine_airspace_class(lid: str, row: dict) -> str | None:
+    """Return the surface airspace class: CLS_ARSP value, else tower->D, else None."""
+    if "_AIRSPACE_CLASS" in row:
+        return row["_AIRSPACE_CLASS"]
+    if row.get("TWR_TYPE_CODE", "").strip().upper() in ("ATCT", "ATCT-R", "ATCT-M"):
+        return "D"
+    return None
+
+
+def set_finder_label(folder: Path, airspace_class: str | None,
+                     label_map: dict[str, int]) -> None:
+    """Apply a macOS Finder color label to a folder via AppleScript (best-effort)."""
+    key = airspace_class if airspace_class in label_map else "unknown"
+    label_idx = label_map.get(key, 6)
+    script = (
+        f'tell application "Finder" to set label index of '
+        f'(POSIX file "{folder.resolve()}" as alias) to {label_idx}'
+    )
+    subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+
+
+def download_pdf(url: str, dest: Path, session: requests.Session, timeout: int) -> None:
+    """Download a PDF; raise if the response is implausibly small (error page)."""
+    resp = session.get(url, timeout=timeout)
+    resp.raise_for_status()
+    if len(resp.content) < 500:
+        raise ValueError(f"Response too small ({len(resp.content)} bytes) — likely an error page")
+    dest.write_bytes(resp.content)

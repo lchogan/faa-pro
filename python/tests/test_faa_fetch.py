@@ -95,3 +95,14 @@ def test_write_runway_csv_round_trips_through_loader(tmp_path):
     # The classifier's loader must read our output back, keyed by lowercase LID.
     loaded = load_nasr_runways(dest)
     assert loaded == {"ord": {"10L", "28R", "4L", "22R"}}
+
+
+def test_determine_airspace_class_prefers_cls_arsp_then_tower():
+    assert faa_fetch.determine_airspace_class("ORD", {"_AIRSPACE_CLASS": "B"}) == "B"
+    # CLS_ARSP present but None -> None even if a tower exists.
+    assert faa_fetch.determine_airspace_class(
+        "XXX", {"_AIRSPACE_CLASS": None, "TWR_TYPE_CODE": "ATCT"}
+    ) is None
+    # No CLS_ARSP entry at all -> infer Class D from tower presence.
+    assert faa_fetch.determine_airspace_class("YYY", {"TWR_TYPE_CODE": "ATCT"}) == "D"
+    assert faa_fetch.determine_airspace_class("ZZZ", {}) is None
