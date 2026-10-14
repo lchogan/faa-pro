@@ -65,3 +65,30 @@ def test_main_exits_nonzero_when_no_diagram(patched, tmp_path, monkeypatch, caps
     assert rc == 2
     assert list(tmp_path.iterdir()) == []          # wrote nothing
     assert "no faa airport diagram" in capsys.readouterr().err.lower()
+
+
+def _write_fake_pdf(dest):
+    dest.write_bytes(b"%PDF-1.4 fake" + b"x" * 600)
+
+
+def test_run_approach_failure_warns_but_keeps_diagram(patched, tmp_path, monkeypatch, capsys):
+    def flaky_download(url, dest, session, timeout):
+        if "approach" in dest.name:
+            raise RuntimeError("boom")
+        _write_fake_pdf(dest)
+
+    monkeypatch.setattr(faa_fetch, "download_pdf", flaky_download)
+    folder, pdf = fetch_airport.run("ord", tmp_path)
+    assert pdf.exists()
+    assert not (folder / "ord-approach.pdf").exists()
+    assert "WARN" in capsys.readouterr().err
+
+
+def test_run_cleans_up_folder_when_diagram_download_fails(patched, tmp_path, monkeypatch):
+    def failing_download(url, dest, session, timeout):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(faa_fetch, "download_pdf", failing_download)
+    with pytest.raises(RuntimeError):
+        fetch_airport.run("ord", tmp_path)
+    assert list(tmp_path.iterdir()) == []
