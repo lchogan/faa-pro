@@ -1,7 +1,11 @@
+import csv
+import io
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime
 
 from pipeline import faa_fetch
+from pipeline.extract_pdf_text import load_nasr_runways
 
 
 def test_get_current_cycle_known_date():
@@ -51,3 +55,43 @@ def test_dedup_folder_increments_suffix(tmp_path):
     assert faa_fetch.dedup_folder(tmp_path, "ord") == tmp_path / "ord-1"
     (tmp_path / "ord-1").mkdir()
     assert faa_fetch.dedup_folder(tmp_path, "ord") == tmp_path / "ord-2"
+
+
+RWY_HEADER = ["ARPT_ID", "RWY_ID", "RWY_LEN"]
+RWY_ROWS = [
+    {"ARPT_ID": "ORD", "RWY_ID": "10L/28R", "RWY_LEN": "13000"},
+    {"ARPT_ID": "ORD", "RWY_ID": "04L/22R", "RWY_LEN": "7500"},
+    {"ARPT_ID": "MDW", "RWY_ID": "13C/31C", "RWY_LEN": "6500"},
+]
+
+
+def _apt_rwy_bytes() -> bytes:
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=RWY_HEADER)
+    w.writeheader()
+    w.writerows(RWY_ROWS)
+    return buf.getvalue().encode("latin-1")
+
+
+def test_filter_runway_rows_matches_lid_case_insensitively():
+    rows = faa_fetch.filter_runway_rows(RWY_ROWS, "ord")
+    assert [r["RWY_ID"] for r in rows] == ["10L/28R", "04L/22R"]
+    assert faa_fetch.filter_runway_rows(RWY_ROWS, "zzz") == []
+
+
+def test_extract_runway_rows_reads_from_zip():
+    zbytes = io.BytesIO()
+    with zipfile.ZipFile(zbytes, "w") as zf:
+        zf.writestr("APT_RWY.csv", _apt_rwy_bytes())
+    zbytes.seek(0)
+    with zipfile.ZipFile(zbytes) as zf:
+        rows = faa_fetch.extract_runway_rows(zf, "ORD")
+    assert {r["RWY_ID"] for r in rows} == {"10L/28R", "04L/22R"}
+
+
+def test_write_runway_csv_round_trips_through_loader(tmp_path):
+    dest = tmp_path / "ord-nasr-rwy.csv"
+    faa_fetch.write_runway_csv(faa_fetch.filter_runway_rows(RWY_ROWS, "ORD"), dest)
+    # The classifier's loader must read our output back, keyed by lowercase LID.
+    loaded = load_nasr_runways(dest)
+    assert loaded == {"ord": {"10L", "28R", "4L", "22R"}}

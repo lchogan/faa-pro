@@ -16,9 +16,13 @@ Key concepts:
 """
 from __future__ import annotations
 
+import csv
+import io
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterable
 
 # ── FAA endpoints ─────────────────────────────────────────────────────────
 BASE_PDF_URL = "https://aeronav.faa.gov/d-tpp/{cycle}/{pdf_name}"
@@ -125,3 +129,48 @@ def dedup_folder(parent: Path, lid: str) -> Path:
         if not candidate.exists():
             return candidate
         i += 1
+
+
+def filter_runway_rows(rows: Iterable[dict], lid: str) -> list[dict]:
+    """Return only the rows whose ARPT_ID matches lid (case-insensitive).
+
+    :param rows: iterable of dicts with ARPT_ID key.
+    :param lid: airport identifier to filter on.
+    :returns: list of matching runway rows.
+    """
+    want = lid.strip().upper()
+    return [r for r in rows if (r.get("ARPT_ID") or "").strip().upper() == want]
+
+
+def extract_runway_rows(
+    zf: zipfile.ZipFile, lid: str, filename: str = "APT_RWY.csv"
+) -> list[dict]:
+    """Read APT_RWY.csv from an open NASR CSV zip and return this airport's rows.
+
+    :param zf: open zipfile.ZipFile from NASR 28-day subscription.
+    :param lid: airport identifier to filter on.
+    :param filename: name of CSV file within the zip (default "APT_RWY.csv").
+    :returns: list of runway rows for this airport.
+    """
+    with zf.open(filename) as f:
+        reader = csv.DictReader(io.TextIOWrapper(f, encoding="latin-1"))
+        return filter_runway_rows(list(reader), lid)
+
+
+def write_runway_csv(rows: list[dict], dest: Path) -> None:
+    """Write runway rows to a CSV the classifier's load_nasr_runways can read.
+
+    Writes all columns present on the rows (load_nasr_runways reads only
+    ARPT_ID and RWY_ID, but preserving the full schema keeps the file a
+    faithful subset of NASR APT_RWY.csv). A no-op when rows is empty.
+
+    :param rows: list of runway dicts to write.
+    :param dest: path where to write the CSV file.
+    """
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with open(dest, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
