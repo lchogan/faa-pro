@@ -152,10 +152,21 @@ process_one() {
     #          ML never sees polygons claimed in steps 1-4.
     # ------------------------------------------------------------------
     echo "   [2/4] Pipeline: classification..."
+    # Per-run fresh NASR runway data from fetch_airport.py, if present.
+    # classify_pipeline.py defaults --nasr-rwy to the static data/ snapshot;
+    # override it with the freshly-downloaded per-airport CSV when provided.
+    local nasr_rwy_arg=()
+    if [[ -n "${NASR_RWY_CSV:-}" && -f "${NASR_RWY_CSV}" ]]; then
+        nasr_rwy_arg=(--nasr-rwy "$NASR_RWY_CSV")
+        echo "   • using fresh NASR runway data: $NASR_RWY_CSV"
+    fi
+    # The "+" guard keeps an empty array from tripping `set -u` on bash 3.2
+    # (macOS system bash), where "${arr[@]}" on an empty array is "unbound".
     "$PYTHON" "$PROJECT/python/classify_pipeline.py" \
         --paths "$paths_csv" \
         --pdf "$pdf" \
         --out "$json_out" \
+        "${nasr_rwy_arg[@]+"${nasr_rwy_arg[@]}"}" \
         $PIPELINE_EXTRA
 
     if [[ ! -f "$json_out" ]]; then
