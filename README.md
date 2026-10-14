@@ -31,6 +31,28 @@ End-to-end on ORD (4331 polygons): **~7 seconds**, ~5 of which is the
 ML model. Step 4 (Illustrator open) adds a few seconds on top when it
 runs.
 
+### On-demand classify (recommended)
+
+`classify-airports.sh` downloads the latest FAA data for an airport on
+demand — you no longer need a pre-built bulk-download directory:
+
+```bash
+bash classify-airports.sh
+# Destination folder [.../artwork/airports]:   (Enter to accept)
+# Airport LID code(s), comma-separated: ord, apf
+# Place approach lights? [y/N]
+```
+
+For each LID it downloads the airport-diagram PDF, best approach chart,
+and this airport's NASR runway data via `python/fetch_airport.py`, into a
+de-duplicated folder (`ord`, then `ord-1`, `ord-2`, … on re-runs), then
+runs the classifier. Fresh runway data is passed to the pipeline via
+`--nasr-rwy`; the airspace class sets the folder's macOS Finder label.
+
+> **Deprecated:** the standalone bulk downloader at
+> `aoa-code/faa-downloader` is superseded by this on-demand path. Its
+> download logic now lives in `python/pipeline/faa_fetch.py`.
+
 ### Auto-open behavior
 
 `classify.sh` decides whether to open the result in Illustrator by
