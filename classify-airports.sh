@@ -1,32 +1,28 @@
 #!/usr/bin/env bash
-# classify-airports.sh — interactive wrapper around classify.sh that
-# moves airport folders out of the daily faa-downloader dump into the
-# long-term artwork folder, then runs classify.sh on each one.
+# classify-airports.sh — on-demand FAA airport classifier.
 #
-# Workflow:
-#   1. Prompt for the source folder (where today's downloads live).
-#   2. Prompt for the destination folder (long-term artwork home).
-#   3. Prompt for one or more comma-separated airport codes.
-#   4. For each code, `mv` the per-code subfolder from source to
-#      destination, then invoke classify.sh on the PDF in its new
-#      location.
+# Prompts for a destination folder and one or more FAA LID codes, then for
+# EACH code:
+#   1. Downloads the latest FAA data (airport-diagram PDF, approach chart,
+#      NASR airspace class + runway rows) via fetch_airport.py into a
+#      de-duplicated folder under the destination (ord, ord-1, ord-2, ...).
+#   2. Runs classify.sh on the freshly-downloaded PDF.
 #
-# Defaults for the two folders come from `classify-wrapper.conf` next
-# to this script. If that file is missing or doesn't define a key,
-# the hardcoded fallbacks below are used. Pressing Enter at a prompt
-# accepts the current default; typing a new path overrides it for
-# this run only (the config file is NOT modified — edit it by hand
-# to change the persistent default).
+# Re-running on an already-classified airport is safe: the folder is
+# de-duplicated, never overwritten. The "Place approach lights?" prompt is
+# forwarded to classify.sh via PLACE_LIGHTS. Fresh per-airport NASR runway
+# data is forwarded via NASR_RWY_CSV.
+#
+# The destination default comes from classify-wrapper.conf (DEFAULT_DEST_DIR);
+# press Enter to accept it or type another path for this run only.
 
 set -euo pipefail
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="$PROJECT/.venv/bin/python3"
 CONFIG="$PROJECT/classify-wrapper.conf"
 
-# Hardcoded fallback defaults. These are overridden by the config
-# file if it exists. Edit classify-wrapper.conf to change persistent
-# defaults; do NOT edit these.
-DEFAULT_SOURCE_DIR="/Users/lukehogan/AOA-Code/faa-downloader/airports-2026-05-06"
+# Hardcoded fallback default. Overridden by classify-wrapper.conf if present.
 DEFAULT_DEST_DIR="/Users/lukehogan/Documents/startups/aoa/products/artwork/airports"
 
 if [[ -f "$CONFIG" ]]; then
@@ -34,79 +30,21 @@ if [[ -f "$CONFIG" ]]; then
     source "$CONFIG"
 fi
 
-# Effective values for this run (start at config-or-fallback default;
-# user can override at the prompt).
-SOURCE_DIR="$DEFAULT_SOURCE_DIR"
 DEST_DIR="$DEFAULT_DEST_DIR"
 
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
-
-# `read -e -p` gives readline editing on the prompt; pressing Enter
-# returns an empty string, in which case we keep the current default.
-read -e -p "Source folder [$SOURCE_DIR]: " input
-if [[ -n "${input:-}" ]]; then
-    SOURCE_DIR="$input"
-fi
-
 read -e -p "Destination folder [$DEST_DIR]: " input
 if [[ -n "${input:-}" ]]; then
     DEST_DIR="$input"
 fi
 
-read -e -p "Airport code(s), comma-separated: " codes_input
+read -e -p "Airport LID code(s), comma-separated: " codes_input
 if [[ -z "${codes_input:-}" ]]; then
     echo "ERROR: no airport codes provided" >&2
     exit 1
 fi
-
-# ---------------------------------------------------------------------------
-# Validate folders
-# ---------------------------------------------------------------------------
-
-if [[ ! -d "$SOURCE_DIR" ]]; then
-    echo "ERROR: source folder does not exist: $SOURCE_DIR" >&2
-    exit 1
-fi
-
-# Create destination if missing — the long-term artwork folder is
-# expected to exist already, but if it's a fresh install or a typo,
-# making it explicit beats failing later inside `mv`.
-mkdir -p "$DEST_DIR"
-
-# ---------------------------------------------------------------------------
-# Process each airport code
-# ---------------------------------------------------------------------------
-
-# Split comma-separated input into an array, trim whitespace, lowercase.
-IFS=',' read -ra RAW_CODES <<< "$codes_input"
-CODES=()
-for raw in "${RAW_CODES[@]}"; do
-    trimmed="$(echo "$raw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-    if [[ -n "$trimmed" ]]; then
-        CODES+=("$trimmed")
-    fi
-done
-
-if [[ ${#CODES[@]} -eq 0 ]]; then
-    echo "ERROR: no valid airport codes after trimming" >&2
-    exit 1
-fi
-
-echo
-echo "Source:      $SOURCE_DIR"
-echo "Destination: $DEST_DIR"
-echo "Codes:       ${CODES[*]}"
-echo
-echo "About to MOVE each code's subfolder from source to destination,"
-echo "then run classify.sh on it in the new location."
-read -e -p "Proceed? [y/N] " confirm
-confirm_lc="$(echo "$confirm" | tr '[:upper:]' '[:lower:]')"
-case "$confirm_lc" in
-    y|yes) ;;
-    *) echo "Aborted."; exit 0 ;;
-esac
 
 read -e -p "Place approach lights? [y/N] " place_lights_in
 case "$(echo "$place_lights_in" | tr '[:upper:]' '[:lower:]')" in
@@ -115,34 +53,64 @@ case "$(echo "$place_lights_in" | tr '[:upper:]' '[:lower:]')" in
 esac
 echo
 
-for code in "${CODES[@]}"; do
-    src_path="$SOURCE_DIR/$code"
-    dst_path="$DEST_DIR/$code"
-    pdf="$dst_path/$code-faa.pdf"
+# ---------------------------------------------------------------------------
+# Normalize codes: split on comma, trim whitespace, lowercase.
+# ---------------------------------------------------------------------------
+IFS=',' read -ra RAW_CODES <<< "$codes_input"
+CODES=()
+for raw in "${RAW_CODES[@]}"; do
+    trimmed="$(echo "$raw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    if [[ -n "$trimmed" ]]; then
+        CODES+=("$trimmed")
+    fi
+done
+if [[ ${#CODES[@]} -eq 0 ]]; then
+    echo "ERROR: no valid airport codes after trimming" >&2
+    exit 1
+fi
 
-    if [[ ! -d "$src_path" ]]; then
-        echo "WARN: $src_path does not exist, skipping $code" >&2
+mkdir -p "$DEST_DIR"
+
+echo "Destination: $DEST_DIR"
+echo "Codes:       ${CODES[*]}"
+echo
+
+# ---------------------------------------------------------------------------
+# Process each code: fetch latest FAA data, then classify.
+# ---------------------------------------------------------------------------
+failed=0
+for code in "${CODES[@]}"; do
+    echo "▶  $code: fetch latest FAA data"
+    # Capture fetch_airport.py stdout so we can read FOLDER= / PDF=.
+    if ! fetch_out="$("$PYTHON" "$PROJECT/python/fetch_airport.py" \
+            --lid "$code" --dest-parent "$DEST_DIR")"; then
+        echo "   FAILED: could not fetch $code (no diagram or download error)" >&2
+        (( failed++ )) || true
         continue
     fi
-    if [[ -e "$dst_path" ]]; then
-        # Refuse to overwrite. The user has to resolve this manually
-        # (rename, delete, or merge). Silent overwrite would risk
-        # losing prior labeling work in the destination folder.
-        echo "ERROR: $dst_path already exists — refusing to overwrite" >&2
-        exit 1
+
+    folder="$(echo "$fetch_out" | sed -n 's/^FOLDER=//p')"
+    pdf="$(echo "$fetch_out" | sed -n 's/^PDF=//p')"
+    if [[ -z "$folder" || -z "$pdf" || ! -f "$pdf" ]]; then
+        echo "   FAILED: fetch produced no usable PDF for $code" >&2
+        (( failed++ )) || true
+        continue
     fi
 
-    echo "▶  $code: mv $src_path -> $dst_path"
-    mv "$src_path" "$dst_path"
+    # Forward fresh per-airport NASR runway data to classify.sh if written.
+    export NASR_RWY_CSV="$folder/$code-nasr-rwy.csv"
 
-    if [[ ! -f "$pdf" ]]; then
-        echo "ERROR: expected PDF at $pdf, none found after move" >&2
-        exit 1
+    echo "▶  $code: classify ($folder)"
+    if ! bash "$PROJECT/classify.sh" "$pdf"; then
+        echo "   FAILED: classify $code" >&2
+        (( failed++ )) || true
     fi
-
-    echo "▶  $code: classify"
-    bash "$PROJECT/classify.sh" "$pdf"
     echo
 done
 
-echo "Done. Processed: ${CODES[*]}"
+if [[ $failed -eq 0 ]]; then
+    echo "Done. Processed: ${CODES[*]}"
+else
+    echo "$failed airport(s) failed."
+    exit 1
+fi
