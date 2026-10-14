@@ -20,6 +20,7 @@ import csv
 import io
 import re
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -270,6 +271,11 @@ def download_nasr(date_str: str, session: requests.Session,
                 _merge_airspace_class(airports, outer_zf, filename=cls_csv[0])
             return airports, runway_rows
 
+    print(
+        "WARN: NASR zip layout not recognized (no CSV_Data/*CSV.zip or APT_BASE.csv); "
+        "returning no airport data",
+        file=sys.stderr,
+    )
     return {}, runway_rows
 
 
@@ -287,11 +293,27 @@ def set_finder_label(folder: Path, airspace_class: str | None,
     """Apply a macOS Finder color label to a folder via AppleScript (best-effort)."""
     key = airspace_class if airspace_class in label_map else "unknown"
     label_idx = label_map.get(key, 6)
+    # Escape backslash first, then double-quote, so the path stays a valid
+    # AppleScript string literal.
+    escaped_path = str(folder.resolve()).replace("\\", "\\\\").replace('"', '\\"')
     script = (
         f'tell application "Finder" to set label index of '
-        f'(POSIX file "{folder.resolve()}" as alias) to {label_idx}'
+        f'(POSIX file "{escaped_path}" as alias) to {label_idx}'
     )
-    subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    # Best-effort: a hung Finder or missing osascript must not abort the fetch.
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=10
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"WARN: could not set Finder label on {folder}: {exc}", file=sys.stderr)
+        return
+    if result.returncode != 0:
+        print(
+            f"WARN: osascript failed to set Finder label on {folder}: "
+            f"{result.stderr.strip()}",
+            file=sys.stderr,
+        )
 
 
 def download_pdf(url: str, dest: Path, session: requests.Session, timeout: int) -> None:
