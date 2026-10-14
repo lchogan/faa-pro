@@ -92,3 +92,14 @@ def test_run_cleans_up_folder_when_diagram_download_fails(patched, tmp_path, mon
     with pytest.raises(RuntimeError):
         fetch_airport.run("ord", tmp_path)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_run_survives_nasr_failure(patched, tmp_path, monkeypatch, capsys):
+    def failing_nasr(date, session, lid=None, timeout=300):
+        raise RuntimeError("nasr 503")
+
+    monkeypatch.setattr(faa_fetch, "download_nasr", failing_nasr)
+    folder, pdf = fetch_airport.run("ord", tmp_path)
+    assert pdf.exists()
+    assert not (folder / "ord-nasr-rwy.csv").exists()
+    assert "NASR fetch failed" in capsys.readouterr().err

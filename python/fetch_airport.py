@@ -48,7 +48,15 @@ def run(lid: str, dest_parent: Path, priority: list[str] | None = None,
     if not apd_pdf:
         raise LookupError(f"no FAA airport diagram for {lid_upper}")
 
-    airports, runway_rows = faa_fetch.download_nasr(date_str, session, lid_upper)
+    # NASR only feeds the cosmetic Finder label and the fresh runway CSV, so an
+    # outage degrades rather than aborts: the classifier falls back to the static
+    # data/nasr_apt_rwy.csv snapshot when no per-airport CSV exists.
+    try:
+        airports, runway_rows = faa_fetch.download_nasr(date_str, session, lid_upper)
+    except Exception as exc:
+        print(f"WARN: NASR fetch failed for {lid_upper} ({exc}); "
+              f"continuing without fresh runway data or airspace label", file=sys.stderr)
+        airports, runway_rows = {}, []
     airspace = faa_fetch.determine_airspace_class(lid_upper, airports.get(lid_upper, {}))
 
     folder = faa_fetch.dedup_folder(dest_parent, lid_lower)
