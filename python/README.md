@@ -21,7 +21,7 @@ python/
 │   ├── extract_pdf_text.py    # NASR designations + PDF text extraction
 │   ├── hull_filter.py         # concave-hull rejection (step 5)
 │   ├── runway_detection.py    # rule-based runway claim (step 2)
-│   ├── runway_label_layout.py # runway-label centerline move (step 3b)
+│   ├── runway_label_layout.py # runway-label centerline move (step 8)
 │   └── taxi_detection.py      # rule-based gray-fill + taxi-label K-nearest
 ├── ml/                     # ML training + utilities
 │   ├── load.py             #   CSV schema + LABELS / ML_LABELS / RULE_CLAIMED_LABELS
@@ -59,7 +59,7 @@ That runs three Python steps:
 | Stage | Script | Purpose |
 |-------|--------|---------|
 | 1     | `pipeline/extract_paths_fitz.py` | PyMuPDF path extraction → `<airport>_paths.csv` |
-| 2     | `classify_pipeline.py`           | 7-substep classification → `<airport>_predictions.json` |
+| 2     | `classify_pipeline.py`           | 8-substep classification → `<airport>_predictions.json` |
 | 3     | `render_svg_layers.py`           | SVG render with native AI layers → `<airport>-diagram.svg` |
 
 Substeps inside `classify_pipeline.py`: 1 taxi surfaces · 2 runways

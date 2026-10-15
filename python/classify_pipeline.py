@@ -22,18 +22,6 @@ from the pool seen by every later step.
                           chart-only token like APF "6" is rejected,
                           and compass-direction names ("NE/SW")
                           qualify for turf strips.
-  3b.  Runway-label move  Layout-only step (no classification change).
-                          For each runway-label group claimed in step
-                          3, finds the FIRST gray-fill Taxi polygon
-                          along the extended centerline past this end
-                          (near_t ≤ 1pt, or the runway-end point sits
-                          inside the polygon), then computes one rigid
-                          translation vector that places the label
-                          group's nearest glyph anchor 2pt past that
-                          polygon's far edge AND centers the group
-                          laterally on the centerline. Without this,
-                          runway labels often render on top of a
-                          taxiway. See pipeline/runway_label_layout.py.
   4.   Taxi Labels        Token regex K-nearest gated on bbox-
                           touches-taxi-surface, restricted to the
                           unclaimed pool. Runs AFTER runway-label
@@ -73,11 +61,27 @@ from the pool seen by every later step.
                           Runways are the only exemption because
                           grass-strip runways are drawn as stroked
                           rectangles (F45 is the canonical case).
+  8.   Runway-label move  Layout-only step (no classification change).
+                          For each runway-label group claimed in step
+                          3, lateral-centers the group on the runway
+                          centerline and marches it outward in 0.5pt
+                          increments past the runway end until no
+                          glyph polygon overlaps any visible polygon
+                          (Taxiways, Runways, Footprints, Taxiway
+                          Labels, Runway Labels — own group excluded),
+                          then adds a 2.0pt minimum-clearance buffer.
+                          Runs LAST because the collision set requires
+                          every polygon's final classification (ML
+                          Footprints, rule-claimed Taxiway Labels,
+                          stroked-sweep demotions). One rigid (dx, dy)
+                          per group goes into the predictions JSON;
+                          render_svg_layers applies it as an SVG
+                          transform. See pipeline/runway_label_layout.py.
 
 Output: predictions JSON consumed by render_svg_layers.py — one
 record per polygon with label, bbox (AI y-up coordinates), and a
 per-polygon (translate_x, translate_y) in PyMuPDF top-left coords for
-step 3b's runway-label move.
+step 8's runway-label move.
 
 Usage:
     python classify_pipeline.py \\
@@ -106,6 +110,8 @@ from pipeline.extract_pdf_text import (
 )
 from pipeline.hull_filter import hull_reject
 from pipeline.runway_detection import detect_runways
+from pipeline.approach_light_layout import compute_approach_light_placements
+from pipeline.approach_lights_data import load_approach_lights
 from pipeline.runway_label_layout import compute_runway_label_translations
 from pipeline.taxi_detection import match_taxi_labels
 
@@ -342,6 +348,16 @@ def _match_runway_labels(runway_indices, all_polys, text_tokens,
             label_indices.update(nearest)
             diag["matched"] = True
             diag["token"] = tok["text"]
+            # Plumb the matched token's full text-stream metadata
+            # through so step 8 (label move) and the renderer's
+            # text-layer pass can recover rotation, font size, and
+            # the original on-page position without re-walking
+            # text_tokens.
+            diag["token_cx"] = float(tok["cx"])
+            diag["token_cy"] = float(tok["cy"])
+            diag["token_dir"] = tuple(tok.get("dir", (1.0, 0.0)))
+            diag["token_font_size"] = float(tok.get("font_size", 0.0))
+            diag["token_font_name"] = str(tok.get("font_name", ""))
             diag["width"] = width
             diag["lat"] = lat
             diag["dist_past_end"] = dist_past
@@ -375,6 +391,12 @@ def main():
                     help="If set, label as Footprints whenever P(Footprints) >= threshold "
                          "(overriding argmax). Lower = more sensitive. 0.5 ≈ argmax, "
                          "try 0.3 or 0.2 to catch borderline buildings.")
+    ap.add_argument("--place-lights", action="store_true",
+                    help="Place approach-lighting symbols (step 8b). Requires "
+                         "--nasr-rwy-end and artwork/lights/lights.json.")
+    ap.add_argument("--nasr-rwy-end", type=Path,
+                    default=Path(__file__).parent.parent / "data" / "nasr_apt_rwy_end.csv",
+                    help="NASR runway-end CSV (per-end approach-light codes).")
     args = ap.parse_args()
 
     # NASR runway designations for THIS airport. Used by the runway-label
@@ -429,34 +451,11 @@ def main():
           f"polygons reassigned: {len(rwy_label_idx)}")
     claimed |= rwy_label_idx
 
-    # ---- Step 3b: runway-label move along the centerline ------------
-    # Layout-only — does NOT change any polygon's class. For every
-    # label group claimed in step 3, computes one rigid translation
-    # vector that places the group's nearest-glyph anchor 2pt past
-    # the FIRST gray-fill Taxi polygon along the extended centerline
-    # AND centers the group laterally on the centerline. Output is a
-    # per-polygon (dx, dy) carried into the predictions JSON as
-    # translate_x / translate_y; render_svg_layers applies it as an
-    # SVG transform. See pipeline/runway_label_layout.py for the full
-    # algorithm + rationale.
-    print(f"[pipeline] step 3b: runway-label move along centerline")
-    label_translations, step3b_diag = compute_runway_label_translations(
-        all_polys, step3_diag, taxi_indices=surf_set,
-    )
-    args.out.with_suffix(".step3b.json").write_text(
-        json.dumps(step3b_diag, indent=2, default=str)
-    )
-    n_moved = sum(
-        1 for tx, ty in label_translations.values()
-        if abs(tx) > 1e-6 or abs(ty) > 1e-6
-    )
-    print(f"  label polygons translated: {n_moved}")
-
     # ---- Step 4: taxi-label K-nearest claim --------------------------
     # Tokens consumed by step 3 are excluded — each PDF text token
     # identifies polygons at most once across the pipeline.
     print(f"[pipeline] step 4: taxi-label K-nearest claim")
-    taxi_label_list = match_taxi_labels(
+    taxi_label_list, taxi_label_groups = match_taxi_labels(
         all_polys, taxi_surfaces, text_tokens,
         claimed_polys=claimed,
         excluded_token_ids=step3_used_token_ids,
@@ -618,10 +617,75 @@ def main():
             stroked_demoted += 1
     print(f"  stroked-only polygons demoted: {stroked_demoted}")
 
+    # ---- Step 8: runway-label move along the centerline -------------
+    # Layout-only — does NOT change any polygon's class. For every
+    # label group claimed in step 3, computes one rigid translation
+    # vector that (a) centers the group laterally on the runway
+    # centerline and (b) marches the group outward along the
+    # centerline until no glyph polygon overlaps any visible polygon
+    # (Taxiways, Runways, Footprints, Taxiway Labels, Runway Labels),
+    # plus a 2.0pt minimum-clearance buffer. Output is a per-polygon
+    # (dx, dy) carried into the predictions JSON as translate_x /
+    # translate_y; render_svg_layers applies it as an SVG transform.
+    # See pipeline/runway_label_layout.py for the full algorithm.
+    #
+    # Runs LAST in the classification flow because the collision set
+    # depends on the final label of every polygon — Footprints come
+    # from ML (step 6), Taxiway Labels from rule (step 4), and the
+    # stroked-only sweep (step 7) demotes lights and decorative
+    # artwork to Other. Earlier in the pipeline the collision set
+    # would be incomplete and the march would stop short.
+    print(f"[pipeline] step 8: runway-label move along centerline")
+    collision_classes = {
+        "Taxiways", "Runways", "Footprints",
+        "Taxiway Labels", "Runway Labels",
+    }
+    collision_indices = {
+        i for i in range(len(all_polys))
+        if final_label[i] in collision_classes
+    }
+    label_translations, step3b_diag = compute_runway_label_translations(
+        all_polys, step3_diag, collision_indices=collision_indices,
+    )
+    args.out.with_suffix(".step3b.json").write_text(
+        json.dumps(step3b_diag, indent=2, default=str)
+    )
+
+    # Step 8b: approach-light placement. Lights may overlap pavement, so
+    # unlike runway labels there is NO collision-march — symbols sit at a
+    # fixed gap off the pavement end. Gated by --place-lights.
+    light_groups: list[dict] = []
+    if args.place_lights:
+        if not args.nasr_rwy_end or not args.nasr_rwy_end.exists():
+            # Warn and skip rather than abort: classify-airports.sh runs a
+            # batch under `set -e`, so a hard exit here would kill the whole
+            # run. Mirrors the renderer's warn-and-continue on missing artwork.
+            print(f"  WARN: --place-lights set but runway-end data not found "
+                  f"({args.nasr_rwy_end}); skipping approach lights")
+        else:
+            als_by_end = load_approach_lights(args.nasr_rwy_end, airport_code)
+            light_groups, step8b_diag = compute_approach_light_placements(
+                all_polys, step3_diag, runway_indices, als_by_end,
+            )
+            args.out.with_suffix(".step8b.json").write_text(
+                json.dumps(step8b_diag, indent=2, default=str)
+            )
+            print(f"  Approach lights placed: {len(light_groups)}")
+
+    n_moved = sum(
+        1 for tx, ty in label_translations.values()
+        if abs(tx) > 1e-6 or abs(ty) > 1e-6
+    )
+    n_capped = sum(
+        1 for d in step3b_diag if d.get("collision_at_rest")
+    )
+    print(f"  label polygons translated: {n_moved}"
+          + (f", hit max-march cap: {n_capped}" if n_capped else ""))
+
     # ---- Build records JSON ------------------------------------------
-    # translate_x / translate_y carry step-3b's per-polygon centerline
+    # translate_x / translate_y carry step 8's per-polygon centerline
     # move (PyMuPDF top-left coords, points). Default 0/0 for every
-    # polygon that step 3b didn't touch. render_svg_layers applies
+    # polygon that step 8 didn't touch. render_svg_layers applies
     # these as `transform="translate(...)"` per <path> element.
     records = []
     for i in range(len(all_polys)):
@@ -653,6 +717,96 @@ def main():
         "y":    round(page_h - t["cy"], 4),  # PDF y-down -> AI y-up
     } for t in text_tokens]
 
+    # Label groups for the text-replacement pass. One record per
+    # claimed runway-label or taxi-label group, carrying the inputs
+    # an SVG <text> element needs:
+    #   text       — token string (e.g. "17R", "B1")
+    #   x, y       — placement center in AI y-up coords. Computed
+    #                from the AABB of the *painted glyph polygons*
+    #                (with step-8 translation applied for runway
+    #                labels), NOT from the PDF text stream's word
+    #                bbox. The text stream is the invisible-search
+    #                layer; its bbox can sit a few points off from
+    #                the visible artwork. AABB-of-polygons gives us
+    #                the actual visual center of the painted glyphs
+    #                so the rendered text overlays them precisely.
+    #   dir_x, dir_y — writing direction unit vector from the PDF
+    #                text stream (`line.dir`). Verified empirically
+    #                to match the painted glyph rotation.
+    #   font_size  — PDF font size in points. Carried per-group for
+    #                debugging; the renderer overrides with the
+    #                per-class median so all labels in a class
+    #                render at the same size (FAA charts use a
+    #                consistent label size, but the PDF text stream
+    #                quantizes it inconsistently across tokens).
+    #   class      — "Runway Labels" or "Taxiway Labels" so the
+    #                renderer can put each on the right layer.
+    def _group_aabb_center(claimed_indices, dx_shift=0.0, dy_shift=0.0):
+        """AABB of the listed polygons' rects (with optional rigid
+        shift), returned as the centroid of that bbox in PDF coords."""
+        xs0, ys0, xs1, ys1 = [], [], [], []
+        for idx in claimed_indices:
+            r = all_polys[idx]["rect"]
+            xs0.append(r[0] + dx_shift)
+            ys0.append(r[1] + dy_shift)
+            xs1.append(r[2] + dx_shift)
+            ys1.append(r[3] + dy_shift)
+        if not xs0:
+            return None
+        return (
+            (min(xs0) + max(xs1)) / 2.0,
+            (min(ys0) + max(ys1)) / 2.0,
+        )
+
+    label_groups: list[dict] = []
+    for diag in step3_diag:
+        if not diag.get("matched"):
+            continue
+        if not diag.get("claimed"):
+            continue
+        claimed_idx = diag["claimed"]
+        # Runway label group rides step 8's translation rigidly —
+        # every glyph in the group has the same (tx, ty) so reading
+        # the first one's translation is exact.
+        tx, ty = label_translations.get(claimed_idx[0], (0.0, 0.0))
+        center = _group_aabb_center(claimed_idx, tx, ty)
+        if center is None:
+            continue
+        cx_pdf, cy_pdf = center
+        dx_dir, dy_dir = diag.get("token_dir", (1.0, 0.0))
+        # dir is stored in PDF y-down coords (the convention SVG also
+        # uses by default). Position is in AI y-up because that's the
+        # downstream convention; the renderer flips position back to
+        # y-down at emit time. Direction does NOT need to flip because
+        # SVG matrices are y-down — flipping dir would mirror-rotate
+        # every non-horizontal label.
+        label_groups.append({
+            "class": "Runway Labels",
+            "text": str(diag["token"]),
+            "x": round(cx_pdf, 4),
+            "y": round(page_h - cy_pdf, 4),  # PDF y-down -> AI y-up
+            "dir_x": round(float(dx_dir), 6),
+            "dir_y": round(float(dy_dir), 6),
+            "font_size": round(float(diag.get("token_font_size", 0.0)), 4),
+            "font_name": str(diag.get("token_font_name", "")),
+        })
+    for grp in taxi_label_groups:
+        center = _group_aabb_center(grp.get("claimed") or [])
+        if center is None:
+            continue
+        cx_pdf, cy_pdf = center
+        dx_dir, dy_dir = grp.get("dir", (1.0, 0.0))
+        label_groups.append({
+            "class": "Taxiway Labels",
+            "text": str(grp["text"]),
+            "x": round(cx_pdf, 4),
+            "y": round(page_h - cy_pdf, 4),
+            "dir_x": round(float(dx_dir), 6),
+            "dir_y": round(float(dy_dir), 6),
+            "font_size": round(float(grp.get("font_size", 0.0)), 4),
+            "font_name": str(grp.get("font_name", "")),
+        })
+
     payload = {
         "airport": records[0]["airport"] if records else None,
         "model_labels": list(LABELS),
@@ -660,6 +814,8 @@ def main():
         "confidence_threshold": None,
         "predictions": records,
         "text_tokens": token_records,
+        "label_groups": label_groups,
+        "light_groups": light_groups,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2))

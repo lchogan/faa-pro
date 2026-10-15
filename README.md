@@ -4,6 +4,8 @@ Classifies vector objects in FAA airport diagram PDFs into semantic
 layers: **Taxiways, Taxiway Labels, Runways, Runway Labels, Footprints,
 Stars, Other**. Output is a layered SVG, plus — for single-airport
 runs — a layer-organized `.ai` opened in Illustrator ready for review.
+Optionally overlays approach-lighting symbols at runway ends from FAA
+NASR data (see [Approach lighting](#approach-lighting-step-8b)).
 
 ## Quick start
 
@@ -28,6 +30,28 @@ bash classify.sh airports/atl-faa.pdf airports/bna-faa.pdf airports/ord-faa.pdf
 End-to-end on ORD (4331 polygons): **~7 seconds**, ~5 of which is the
 ML model. Step 4 (Illustrator open) adds a few seconds on top when it
 runs.
+
+### On-demand classify (recommended)
+
+`classify-airports.sh` downloads the latest FAA data for an airport on
+demand — you no longer need a pre-built bulk-download directory:
+
+```bash
+bash classify-airports.sh
+# Destination folder [.../artwork/airports]:   (Enter to accept)
+# Airport LID code(s), comma-separated: ord, apf
+# Place approach lights? [y/N]
+```
+
+For each LID it downloads the airport-diagram PDF, best approach chart,
+and this airport's NASR runway data via `python/fetch_airport.py`, into a
+de-duplicated folder (`ord`, then `ord-1`, `ord-2`, … on re-runs), then
+runs the classifier. Fresh runway data is passed to the pipeline via
+`--nasr-rwy`; the airspace class sets the folder's macOS Finder label.
+
+> **Deprecated:** the standalone bulk downloader at
+> `aoa-code/faa-downloader` is superseded by this on-demand path. Its
+> download logic now lives in `python/pipeline/faa_fetch.py`.
 
 ### Auto-open behavior
 
@@ -68,7 +92,7 @@ panel.
         ▼
 <airport>_paths.csv             4331 polygons w/ geometric features
         │
-        │  Step 2   classify_pipeline.py — the brain (6 substeps)
+        │  Step 2   classify_pipeline.py — the brain (8 substeps)
         ▼
 <airport>_predictions.json      one record per polygon, AI y-up bbox
         │
@@ -98,7 +122,7 @@ run. It:
    reference data, not part of the editable diagram.
 6. Saves the `.ai` and leaves it open for review.
 
-### `classify_pipeline.py` — the 7 substeps
+### `classify_pipeline.py` — the 8 substeps
 
 Polygons claimed in earlier substeps are **removed from the pool** seen
 by every later substep. ML only decides Footprints / Stars / Other; the
@@ -134,41 +158,6 @@ Labels) are all claimed in steps 1–4 before ML runs.
    another runway end. Runs **before** taxi labels (step 4) so a digit
    glyph belonging to a runway designator (e.g. APF "5" sitting over a
    taxiway) is reserved before taxi-label matching can grab it.
-
-   **3b. Runway-label move along the centerline (layout).** Layout-
-   only step — does NOT change which layer any polygon is on.
-   Implemented in [`python/pipeline/runway_label_layout.py`](python/pipeline/runway_label_layout.py).
-   For every label group claimed in step 3, picks the **first
-   filled-Taxi polygon along the extended centerline past this end**
-   and aligns the label `2pt` past that polygon's far edge. The
-   translation has TWO components combined into one rigid `(dx, dy)`
-   applied to every polygon in the group:
-
-   - **Longitudinal**: cast a ray from the runway-end point along the
-     outward principal axis. The first filled-Taxi polygon the ray
-     enters is the contiguous extension — its smallest ray-vs-boundary
-     intersection is `near_t`, its largest is `far_t`. The label's
-     nearest-glyph anchor (computed from actual polygon anchors, NOT
-     bbox — an angled "22L" has empty bbox corners that would push the
-     visible glyph too far) is shifted to land at
-     `half_len + far_t + 2pt` along the outward axis. If the runway
-     end happens to sit INSIDE the polygon (gray fill extending across
-     the threshold, common on FAA charts), `near_t` is treated as 0.
-     Sanity gate: `near_t ≤ 1pt` so a polygon 30pt past the threshold
-     across a gap doesn't get picked.
-
-   - **Lateral**: also center the group on the centerline. The
-     label's anchor-bounds midpoint perpendicular to the runway axis
-     is computed from actual polygon anchors
-     (`(lat_min + lat_max) / 2`), and the group is shifted so that
-     midpoint sits at `lat = 0`. Without this, labels drawn slightly
-     off-axis (left or right of the centerline in the source PDF)
-     would still be off-axis after the longitudinal move.
-
-   The translation per polygon is carried through the predictions
-   JSON as `translate_x` / `translate_y` and applied as an SVG
-   `transform="translate(...)"` per `<path>` in stage 3 (renderer) —
-   original PDF geometry stays intact.
 
 4. **Taxi Labels (rule-based).** PDF text tokens matching
    `^([A-Z][A-Z]?[0-9]{0,2}|[0-9])$` whose centroid sits inside a
@@ -207,9 +196,170 @@ Labels) are all claimed in steps 1–4 before ML runs.
    exemption because grass-strip runways are drawn as stroked
    rectangles (F45 is the canonical case).
 
+8. **Runway-label move along the centerline (layout).** Layout-only
+   — does NOT change which layer any polygon is on. Implemented in
+   [`python/pipeline/runway_label_layout.py`](python/pipeline/runway_label_layout.py).
+   Runs LAST because the collision set requires every polygon's final
+   classification (ML-derived Footprints, rule-claimed Taxi Labels,
+   stroked-sweep demotions). The translation has TWO components
+   combined into one rigid `(dx, dy)` applied to every polygon in the
+   group:
+
+   - **Lateral**: center the group on the centerline. The label's
+     anchor-bounds midpoint perpendicular to the runway axis is
+     computed from actual polygon anchors (`(lat_min + lat_max) / 2`,
+     NOT bbox — an asymmetric "9R" has the wider R glyph that would
+     pull a bbox center off the centerline), and the group is shifted
+     so that midpoint sits at `lat = 0`.
+
+   - **Longitudinal (march-and-test)**: start with the label's inner
+     edge AT the runway end (`half_len - current_inner`), then march
+     outward along the centerline in 0.5pt increments. At each step,
+     translate every glyph polygon by the trial `(dx, dy)` and test
+     polygon-polygon overlap (point-in-polygon both ways + edge
+     crossings, with a bbox prefilter) against every visible polygon
+     — Taxiways, Runways, Footprints, Taxi Labels, other Runway
+     Labels — minus the group's own polys. The first step at which
+     no glyph overlaps anything is the resting position; add 2.0pt
+     as a minimum-clearance buffer (matches the visual spacing of
+     the older hold-pad-based algorithm). Net clearance from the
+     nearest pavement edge is in `[2.0, 2.5]`pt.
+
+   This replaced an earlier rule that picked the first gray-fill
+   polygon along the extended centerline and aligned past its far
+   edge. The first-polygon rule was brittle when a crossing runway
+   sat past the runway end (the centerline crossed it but the
+   geometry-only "first gray fill" check ignored it, so the label
+   landed on the crossing pavement) and when pavement was fragmented
+   or the hold pad was missing from the gray-fill set. The
+   march-and-test approach is geometry-only and naturally handles all
+   of those cases — the label moves until visibly clear.
+
+   The translation per polygon is carried through the predictions
+   JSON as `translate_x` / `translate_y` and applied as an SVG
+   `transform="translate(...)"` per `<path>` in stage 3 (renderer) —
+   original PDF geometry stays intact.
+
 The PDF Text Tokens debug layer is always emitted: every word in the
 PDF text stream as a magenta 4pt text frame at its bbox center.
 Useful for spot-checking why a token did or didn't qualify.
+
+## Approach lighting (step 8b)
+
+> **Status (2026-05-29): implemented and unit-tested, not yet verified
+> end-to-end.** The code path is complete and the full test suite passes,
+> but it stays dormant until the two inputs below are supplied. See the
+> [Activation checklist](#activation-checklist-task-10) at the end of this
+> section.
+
+Overlays an approach-lighting-system (ALS) symbol at each runway end that
+has one — oriented to the runway, scaled uniformly per diagram, placed a
+fixed gap off the pavement end. Off by default; enable with `--place-lights`.
+
+Unlike runway-number labels (step 8), lights **may overlap** runways and
+taxiways, so there is **no collision-march** — each symbol sits at a fixed
+offset. Lights and runway-number labels deliberately share screen space:
+they're separate, individually toggleable SVG layers and only one is on at a
+time. (This renderer-injected **Approach Lights** layer is distinct from the
+manual-only **Lights** placeholder in step 4, which holds stroked
+light-stripe artwork the classifier demotes to Other.)
+
+### How to enable
+
+```bash
+# Single airport, via classify.sh
+PLACE_LIGHTS=1 bash classify.sh /path/to/<airport>-faa.pdf
+
+# Interactive wrapper — prompts "Place approach lights? [y/N]"
+bash classify-airports.sh
+
+# Or call the pipeline directly
+PYTHONPATH=python python python/classify_pipeline.py --place-lights ...
+```
+
+### Required inputs
+
+| Input | Path | Source |
+|-------|------|--------|
+| Runway-end ALS data | `data/nasr_apt_rwy_end.csv` | FAA 28-day NASR subscription — the **APT_RWY_END** table (field "APPROACH LIGHT SYSTEM") |
+| Symbol artwork | `artwork/lights/lights.json` | built offline from per-archetype SVGs (see [Artwork build](#artwork-build)) |
+
+When either input is missing the pipeline **warns and skips** lights rather
+than aborting — so a batch run never dies on a missing file.
+
+### How a symbol is placed
+
+No magnetic-heading or lat/long lookup is needed. Step 3 already pairs each
+geometric runway end with its painted runway-number token; that pairing is
+the bridge: matched token → end designator → ALS code for that end. If only
+one end's number was detected, the other is its reciprocal; if neither was
+detected, the runway is skipped.
+
+- **Scale is one value per diagram.** `target_width = k · (2 · max_half_wid)`,
+  where `max_half_wid` is the widest runway's *depicted* half-width (PDF
+  points). Every symbol uses the same `target_width`, so all lights on a page
+  hold one size relationship regardless of which runway they sit on — a
+  zoomed-out chart (DEN) gets proportionally smaller lights than a zoomed-in
+  small field. `gap = g · target_width`. `k`/`g` are tuning constants in
+  [`approach_light_layout.py`](python/pipeline/approach_light_layout.py).
+- **Orientation / position.** Centered on the runway centerline, `(half_len +
+  gap)` off the pavement end, rotated to the runway axis.
+- **Output.** `light_groups` `{artwork_key, x, y, dir_x, dir_y, target_width}`
+  in the predictions JSON; the renderer injects each as `<path>` artwork under
+  a `matrix(s·dir_x, s·dir_y, -s·dir_y, s·dir_x, x, y)` transform (`s =
+  target_width / native_width`) into the **Approach Lights** layer, placed
+  just below **PDF Text Tokens** in the z-order.
+
+### Artwork build
+
+Author one **named artboard per archetype** in a single Illustrator file, all
+artboards the **same width** (that width is the runway-width reference). Draw
+each symbol with its attach point at the artboard's bottom-center, extending
+upward. *File → Export → Export for Screens* writes one SVG per artboard
+(named by artboard) into `artwork/lights/`. Then build the library:
+
+```bash
+PYTHONPATH=python python python/pipeline/build_light_artwork.py \
+    artwork/lights/ artwork/lights/lights.json
+```
+
+The build flattens each SVG to absolute paths (Bézier curves and `<rect>` /
+`<circle>` / `<line>` primitives preserved), normalizes to the canonical
+frame (attach point → origin, "up" → +X), asserts all artboards share one
+width, and writes `lights.json`. Runtime parses no SVG — only that JSON.
+
+### FAA code → artwork key
+
+Several FAA codes share one symbol (table in
+[`approach_lights_data.py`](python/pipeline/approach_lights_data.py)):
+
+| Artwork key | FAA codes |
+|-------------|-----------|
+| `alsf1` | ALSF1 |
+| `alsf2` | ALSF2 |
+| `malsr` | MALSR, SSALR |
+| `malsf` | MALSF, SSALF |
+| `mals`  | MALS, SSALS |
+| `sals`  | SALS, SALSF |
+| `odals` | ODALS |
+
+`NONE`/blank → no symbol. Any code not in the table also draws nothing and is
+logged as `unmapped_code` in `<airport>_predictions.step8b.json`, so new/edge
+FAA codes surface for review. Scope is **centerline ALS only** — REIL,
+PAPI/VASI, and touchdown-zone lights are out (they need different placement
+models).
+
+### Activation checklist (Task 10)
+
+1. Download a current **APT_RWY_END.csv** → `data/nasr_apt_rwy_end.csv`.
+   **[VERIFY]** its airport-id / runway-end-id / approach-light column
+   headers and trim the alias tuples in `approach_lights_data.py` to the real
+   names (the loader errors loudly if none match).
+2. Draw the archetype artboards, export, and build `artwork/lights/lights.json`.
+   **[VERIFY]** the artboard `width` attribute equals its viewBox units on a
+   real exported file (the canonical transform assumes they match).
+3. Calibrate `k` (size) and `g` (gap) in `approach_light_layout.py` on DEN +
+   a small field, then confirm all lights on a page share one scale.
 
 ## Layout
 
@@ -220,7 +370,7 @@ faa-pro/
 ├── classify-wrapper.conf                # default folder paths for the wrapper
 ├── README.md                            # this file
 ├── python/
-│   ├── classify_pipeline.py             # 7-substep orchestrator (Stage 2)
+│   ├── classify_pipeline.py             # 8-substep orchestrator (Stage 2)
 │   ├── render_svg_layers.py             # SVG export (Stage 3)
 │   ├── pipeline/                        # rule-based detection modules
 │   │   ├── chart_scene.py               #   PDF → polygons + clips + tokens
@@ -229,8 +379,13 @@ faa-pro/
 │   │   ├── extract_pdf_text.py          #   NASR + text extraction
 │   │   ├── hull_filter.py               #   concave-hull rejection (substep 5)
 │   │   ├── runway_detection.py          #   rule-based runway (substep 2)
-│   │   ├── runway_label_layout.py       #   centerline label move (substep 3b)
-│   │   └── taxi_detection.py            #   gray-fill + taxi-label K-nearest
+│   │   ├── runway_label_layout.py       #   centerline label move (substep 8)
+│   │   ├── taxi_detection.py            #   gray-fill + taxi-label K-nearest
+│   │   ├── approach_lights_data.py      #   NASR APT_RWY_END loader + code→artwork map
+│   │   ├── approach_light_layout.py     #   approach-light placement (substep 8b)
+│   │   ├── light_artwork.py             #   runtime artwork-library loader
+│   │   └── build_light_artwork.py       #   offline: artboard SVGs → lights.json
+│   ├── tests/                           # pytest suite (approach lighting + harness)
 │   ├── ml/                              # ML training + utilities
 │   │   ├── load.py                      #   CSV schema + LABELS constants
 │   │   ├── relational.py                #   feature engineering
@@ -240,8 +395,10 @@ faa-pro/
 │   ├── _deprecated/                     # confirmed dead, kept for git history
 │   ├── char_training_legacy/            # pre-rebuild char-classifier code
 │   └── README.md                        # Python-side details + retraining
+├── artwork/lights/                     # approach-light SVG artboards + built lights.json (you supply; see Approach lighting)
 ├── data/
 │   ├── nasr_apt_rwy.csv                 # FAA NASR runway designations
+│   ├── nasr_apt_rwy_end.csv             # FAA NASR per-end ALS codes (you supply; see Approach lighting)
 │   └── char_training_legacy/            # old char-corpus training data
 ├── ImportPredictedLayers.jsx            # legacy JSX renderer, no longer invoked
 ├── ExportClassifiedPaths.jsx            # legacy labeled-export (replaced by ml/extract_labeled_corpus.py)

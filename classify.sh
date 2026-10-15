@@ -50,6 +50,12 @@ export PYTHONPATH="$PROJECT/python${PYTHONPATH:+:$PYTHONPATH}"
 # Default disables hull rejection (see header comment for rationale).
 PIPELINE_EXTRA="${PIPELINE_EXTRA:---skip-hull}"
 
+# Optional: place approach-lighting symbols (step 8b). Enable by exporting
+# PLACE_LIGHTS=1 (classify-airports.sh sets this from an interactive prompt).
+if [[ "${PLACE_LIGHTS:-0}" == "1" ]]; then
+    PIPELINE_EXTRA="${PIPELINE_EXTRA:-} --place-lights"
+fi
+
 # Single-airport invocations get auto-opened in Illustrator. Batch
 # invocations (>1 arg) skip the open step to avoid a window per airport.
 # Set OPEN_AFTER_CLASSIFY=0 to disable, OPEN_AFTER_CLASSIFY=1 to force on.
@@ -146,10 +152,21 @@ process_one() {
     #          ML never sees polygons claimed in steps 1-4.
     # ------------------------------------------------------------------
     echo "   [2/4] Pipeline: classification..."
+    # Per-run fresh NASR runway data from fetch_airport.py, if present.
+    # classify_pipeline.py defaults --nasr-rwy to the static data/ snapshot;
+    # override it with the freshly-downloaded per-airport CSV when provided.
+    local nasr_rwy_arg=()
+    if [[ -n "${NASR_RWY_CSV:-}" && -f "${NASR_RWY_CSV}" ]]; then
+        nasr_rwy_arg=(--nasr-rwy "$NASR_RWY_CSV")
+        echo "   • using fresh NASR runway data: $NASR_RWY_CSV"
+    fi
+    # The "+" guard keeps an empty array from tripping `set -u` on bash 3.2
+    # (macOS system bash), where "${arr[@]}" on an empty array is "unbound".
     "$PYTHON" "$PROJECT/python/classify_pipeline.py" \
         --paths "$paths_csv" \
         --pdf "$pdf" \
         --out "$json_out" \
+        "${nasr_rwy_arg[@]+"${nasr_rwy_arg[@]}"}" \
         $PIPELINE_EXTRA
 
     if [[ ! -f "$json_out" ]]; then

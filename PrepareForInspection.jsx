@@ -30,7 +30,9 @@
 
     // Top-of-panel first. doc.layers[0] is the topmost layer in Illustrator.
     var LAYER_ORDER = [
+        "Runway Labels (Text)",
         "Runway Labels",
+        "Taxiway Labels (Text)",
         "Taxiway Labels",
         "Stars",
         "Lights",
